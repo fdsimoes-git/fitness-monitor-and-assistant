@@ -1,0 +1,17 @@
+[Unit]
+Description=Garmin BLE Heart Rate Listener
+After=bluetooth.service network-online.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+# EDIT THESE PATHS to match your install
+WorkingDirectory=/home/pi/garmin-monitor
+EnvironmentFile=/home/pi/garmin-monitor/.env
+ExecStart=/home/pi/garmin-monitor/.venv/bin/python -m src.cli ble
+Restart=on-failure
+RestartSec=10
+User=pi
+
+[Install]
+WantedBy=multi-user.target

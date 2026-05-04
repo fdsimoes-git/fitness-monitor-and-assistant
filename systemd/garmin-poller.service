@@ -1,0 +1,11 @@
+[Unit]
+Description=Garmin Connect Poller (oneshot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/garmin-monitor
+EnvironmentFile=/home/pi/garmin-monitor/.env
+ExecStart=/home/pi/garmin-monitor/.venv/bin/python -m src.cli poll
+User=pi
