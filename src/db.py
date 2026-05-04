@@ -128,3 +128,50 @@ def last_alert_ts(db_path: Path, kind: str) -> datetime | None:
             (kind,),
         ).fetchone()
     return datetime.fromisoformat(row[0]) if row else None
+
+
+def recent_resting_hr(db_path: Path, days: int) -> list[tuple[str, int]]:
+    """Return [(date, resting_hr)] for the last `days` days, oldest first.
+
+    Skips days with NULL resting_hr.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT date, resting_hr FROM daily_summary "
+            "WHERE resting_hr IS NOT NULL "
+            "ORDER BY date DESC LIMIT ?",
+            (days,),
+        ).fetchall()
+    return [(r[0], int(r[1])) for r in reversed(rows)]
+
+
+def recent_hrv_overnight(db_path: Path, days: int) -> list[tuple[str, int]]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT date, hrv_overnight FROM daily_summary "
+            "WHERE hrv_overnight IS NOT NULL "
+            "ORDER BY date DESC LIMIT ?",
+            (days,),
+        ).fetchall()
+    return [(r[0], int(r[1])) for r in reversed(rows)]
+
+
+def avg_hr_between(db_path: Path, start_iso: str, end_iso: str) -> tuple[float, int] | None:
+    """(avg_bpm, sample_count) from hr_realtime within an ISO UTC window. None if no rows."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT AVG(bpm), COUNT(*) FROM hr_realtime WHERE ts >= ? AND ts < ?",
+            (start_iso, end_iso),
+        ).fetchone()
+    if not row or not row[1]:
+        return None
+    return (float(row[0]), int(row[1]))
+
+
+def daily_summary_for(db_path: Path, date_iso: str) -> dict | None:
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM daily_summary WHERE date = ?", (date_iso,)
+        ).fetchone()
+    return dict(row) if row else None

@@ -14,6 +14,7 @@ from garminconnect import Garmin
 
 from . import alerts, db
 from .config import Config
+from .smart_alerts import run_smart_alerts
 
 log = logging.getLogger(__name__)
 
@@ -154,4 +155,5 @@ def run_once(cfg: Config) -> None:
     )
     db.upsert_daily_summary(cfg.db_path, today, summary)
     check_resting_hr(cfg, summary)
+    run_smart_alerts(cfg)
     log.info("Poll complete")
