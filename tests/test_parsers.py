@@ -1,5 +1,5 @@
 """Unit tests for the BLE Heart Rate Measurement parser."""
-from src.ble_listener import parse_hr_measurement
+from src.parsers import parse_hr_measurement
 
 
 def test_uint8_no_rr():

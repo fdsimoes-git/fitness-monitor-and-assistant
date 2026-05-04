@@ -2,7 +2,8 @@
 
 Subscribes to the standard BLE Heart Rate Measurement characteristic (0x2A37)
 on any device advertising the Heart Rate Service (0x180D). Parses HR + RR
-intervals per the Bluetooth GATT spec.
+intervals per the Bluetooth GATT spec and auto-reconnects on disconnect /
+out-of-range with exponential backoff.
 """
 from __future__ import annotations
 
@@ -11,50 +12,23 @@ import logging
 from typing import Callable
 
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakError
 
 from . import alerts, db
 from .config import Config
+from .parsers import parse_hr_measurement  # re-exported for callers/tests
 
 log = logging.getLogger(__name__)
 
 HR_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HR_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 
-
-def parse_hr_measurement(data: bytearray) -> tuple[int, list[int]]:
-    """Parse the Heart Rate Measurement characteristic.
-
-    Returns (bpm, rr_intervals_ms). RR list may be empty.
-    See: https://www.bluetooth.com/specifications/specs/heart-rate-service-1-0/
-    """
-    flags = data[0]
-    hr_uint16 = bool(flags & 0x01)
-    rr_present = bool(flags & 0x10)
-    energy_present = bool(flags & 0x08)
-
-    offset = 1
-    if hr_uint16:
-        bpm = int.from_bytes(data[offset:offset + 2], "little")
-        offset += 2
-    else:
-        bpm = data[offset]
-        offset += 1
-
-    if energy_present:
-        offset += 2  # skip energy expended
-
-    rr_intervals: list[int] = []
-    if rr_present:
-        # RR values are 1/1024 second resolution, uint16 little-endian
-        while offset + 1 < len(data):
-            raw = int.from_bytes(data[offset:offset + 2], "little")
-            rr_intervals.append(round(raw * 1000 / 1024))
-            offset += 2
-
-    return bpm, rr_intervals
+SCAN_TIMEOUT_S = 15.0
+INITIAL_BACKOFF_S = 2.0
+MAX_BACKOFF_S = 300.0  # 5 min cap — watch may be off-wrist for a while
 
 
-async def find_watch(timeout: float = 15.0):
+async def find_watch(timeout: float = SCAN_TIMEOUT_S):
     """Scan for any device advertising the HR service."""
     log.info("Scanning for BLE HR broadcaster (%.0fs)...", timeout)
     device = await BleakScanner.find_device_by_filter(
@@ -89,23 +63,39 @@ def make_handler(cfg: Config) -> Callable:
     return on_notify
 
 
+async def _run_one_session(cfg: Config) -> None:
+    """Single connect+stream cycle. Raises on any failure so the outer loop can retry."""
+    device = await find_watch()
+    async with BleakClient(device) as client:
+        log.info("Connected to %s", device.address)
+        await client.start_notify(HR_MEASUREMENT_UUID, make_handler(cfg))
+        while client.is_connected:
+            await asyncio.sleep(1.0)
+        log.warning("BLE client reports disconnected")
+
+
 async def run(cfg: Config) -> None:
-    """Connect, subscribe, and stream until cancelled. Auto-reconnects on disconnect."""
-    backoff = 1.0
+    """Connect, subscribe, and stream forever.
+
+    Wraps a single BLE session in a retry loop with exponential backoff. The
+    watch routinely goes out of range or stops broadcasting (e.g. when the user
+    starts an activity). Any exception is treated as recoverable; only
+    asyncio.CancelledError exits the loop.
+    """
+    backoff = INITIAL_BACKOFF_S
     while True:
         try:
-            device = await find_watch()
-            async with BleakClient(device) as client:
-                log.info("Connected to %s", device.address)
-                backoff = 1.0  # reset backoff on success
-                await client.start_notify(HR_MEASUREMENT_UUID, make_handler(cfg))
-                # Sleep forever; bleak will raise on disconnect
-                while client.is_connected:
-                    await asyncio.sleep(1.0)
-                log.warning("BLE client disconnected")
+            await _run_one_session(cfg)
+            # Clean disconnect — try again right away with reset backoff.
+            backoff = INITIAL_BACKOFF_S
         except asyncio.CancelledError:
+            log.info("BLE listener cancelled, exiting")
             raise
-        except Exception as e:
-            log.error("BLE loop error: %s. Retrying in %.1fs", e, backoff)
+        except (BleakError, RuntimeError, OSError) as e:
+            log.warning("BLE session ended: %s. Reconnecting in %.1fs", e, backoff)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
+            backoff = min(backoff * 2.0, MAX_BACKOFF_S)
+        except Exception as e:  # last-resort guard so the daemon never dies
+            log.exception("Unexpected BLE loop error: %s. Retrying in %.1fs", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, MAX_BACKOFF_S)
