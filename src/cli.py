@@ -28,6 +28,9 @@ def main(argv: list[str] | None = None) -> int:
         "--date",
         help="ISO date (YYYY-MM-DD) to summarize. Defaults to yesterday.",
     )
+    dash_p = sub.add_parser("dashboard", help="Run the FastAPI dashboard (optional)")
+    dash_p.add_argument("--host", default="127.0.0.1")
+    dash_p.add_argument("--port", type=int, default=8000)
 
     args = p.parse_args(argv)
     cfg = Config.from_env()
@@ -66,6 +69,11 @@ def main(argv: list[str] | None = None) -> int:
         ok = digest.send_digest(cfg, target)
         print("Sent" if ok else "No data / send failed")
         return 0 if ok else 1
+
+    if args.cmd == "dashboard":
+        from . import dashboard
+        dashboard.serve(cfg, host=args.host, port=args.port)
+        return 0
 
     return 2
 

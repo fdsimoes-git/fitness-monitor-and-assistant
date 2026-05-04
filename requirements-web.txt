@@ -1,0 +1,4 @@
+# Optional dashboard dependencies. Install with:
+#   .venv/bin/pip install -r requirements-web.txt
+fastapi>=0.110.0
+uvicorn>=0.29.0
