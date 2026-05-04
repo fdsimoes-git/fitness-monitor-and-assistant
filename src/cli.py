@@ -23,6 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("ble", help="Run the BLE HR listener (blocks)")
     sub.add_parser("poll", help="Run one Garmin Connect poll")
     sub.add_parser("test-alert", help="Send a Telegram test message")
+    digest_p = sub.add_parser("digest", help="Send the daily Telegram digest")
+    digest_p.add_argument(
+        "--date",
+        help="ISO date (YYYY-MM-DD) to summarize. Defaults to yesterday.",
+    )
 
     args = p.parse_args(argv)
     cfg = Config.from_env()
@@ -53,6 +58,14 @@ def main(argv: list[str] | None = None) -> int:
         from . import garmin_poller
         garmin_poller.run_once(cfg)
         return 0
+
+    if args.cmd == "digest":
+        from datetime import date as date_cls
+        from . import digest
+        target = date_cls.fromisoformat(args.date) if args.date else None
+        ok = digest.send_digest(cfg, target)
+        print("Sent" if ok else "No data / send failed")
+        return 0 if ok else 1
 
     return 2
 

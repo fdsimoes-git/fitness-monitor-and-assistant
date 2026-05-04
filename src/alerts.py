@@ -13,7 +13,8 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 
-def _send_telegram(cfg: Config, text: str) -> bool:
+def send_telegram(cfg: Config, text: str) -> bool:
+    """Post a Markdown message to the configured chat. Returns True on 2xx."""
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
     try:
         r = requests.post(
@@ -26,6 +27,9 @@ def _send_telegram(cfg: Config, text: str) -> bool:
     except Exception as e:
         log.error("Telegram send failed: %s", e)
         return False
+
+
+_send_telegram = send_telegram  # back-compat alias
 
 
 def maybe_alert(cfg: Config, kind: str, text: str, payload: dict | None = None) -> bool:
@@ -41,7 +45,7 @@ def maybe_alert(cfg: Config, kind: str, text: str, payload: dict | None = None) 
                       kind, cfg.alert_cooldown_seconds - elapsed)
             return False
 
-    sent = _send_telegram(cfg, text)
+    sent = send_telegram(cfg, text)
     db.log_alert(cfg.db_path, kind, json.dumps(payload or {}), sent)
     if sent:
         log.info("Alert sent: %s", kind)
@@ -50,4 +54,4 @@ def maybe_alert(cfg: Config, kind: str, text: str, payload: dict | None = None) 
 
 def test_alert(cfg: Config) -> bool:
     """Send a test message regardless of cooldown."""
-    return _send_telegram(cfg, "✅ *garmin-monitor* test alert — bot is working.")
+    return send_telegram(cfg, "✅ *garmin-monitor* test alert — bot is working.")
