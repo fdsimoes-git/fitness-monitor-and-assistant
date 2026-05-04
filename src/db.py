@@ -42,6 +42,14 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 CREATE INDEX IF NOT EXISTS idx_alerts_kind ON alerts(kind);
+
+CREATE TABLE IF NOT EXISTS hrv (
+    ts          TEXT NOT NULL,         -- ISO8601 UTC, end of the window
+    rmssd_ms    REAL NOT NULL,
+    rr_count    INTEGER NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'ble'
+);
+CREATE INDEX IF NOT EXISTS idx_hrv_ts ON hrv(ts);
 """
 
 
@@ -70,6 +78,15 @@ def insert_hr(db_path: Path, bpm: int, rr_ms: list[int] | None = None) -> None:
         conn.execute(
             "INSERT INTO hr_realtime (ts, bpm, rr_ms) VALUES (?, ?, ?)",
             (ts, bpm, rr_str),
+        )
+
+
+def insert_hrv(db_path: Path, rmssd_ms: float, rr_count: int, source: str = "ble") -> None:
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO hrv (ts, rmssd_ms, rr_count, source) VALUES (?, ?, ?, ?)",
+            (ts, float(rmssd_ms), int(rr_count), source),
         )
 
 
