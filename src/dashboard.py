@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import db
+from . import db, metric_info
 from .config import Config
 
 if TYPE_CHECKING:
@@ -242,6 +242,118 @@ INDEX_HTML = """<!doctype html>
       background: currentColor; vertical-align: middle;
       margin-right: 0.5rem;
     }
+
+    /* — Info button on each card — */
+    .info-btn {
+      position: absolute;
+      top: 12px; right: 12px;
+      width: 22px; height: 22px;
+      display: inline-flex; align-items: center; justify-content: center;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.02);
+      color: var(--muted);
+      font-size: 11px; font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      z-index: 5;
+    }
+    .info-btn:hover {
+      color: var(--cyan);
+      border-color: rgba(0,245,255,0.5);
+      background: rgba(0,245,255,0.08);
+      box-shadow: 0 0 8px rgba(0,245,255,0.4);
+    }
+
+    /* — Slide-in info panel — */
+    .info-overlay {
+      position: fixed; inset: 0;
+      background: rgba(2, 4, 10, 0.6);
+      backdrop-filter: blur(2px);
+      z-index: 50;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.2s ease;
+    }
+    .info-overlay.open { opacity: 1; pointer-events: auto; }
+
+    .info-sheet {
+      position: fixed; top: 0; right: 0; bottom: 0;
+      width: min(440px, 100vw);
+      background: linear-gradient(180deg, var(--ink-1) 0%, var(--ink-0) 100%);
+      border-left: 1px solid var(--line);
+      box-shadow: -20px 0 50px rgba(0,0,0,0.5);
+      z-index: 51;
+      transform: translateX(100%);
+      transition: transform 0.32s cubic-bezier(.22,.94,.30,1);
+      overflow-y: auto;
+      padding: 1.6rem 1.5rem 3rem;
+    }
+    .info-sheet.open { transform: translateX(0); }
+    .info-sheet::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+      background: linear-gradient(90deg, var(--cyan), var(--magenta) 60%, var(--amber));
+      filter: drop-shadow(0 0 6px rgba(0,245,255,0.5));
+    }
+    .info-sheet h3 {
+      font-size: 1.4rem; font-weight: 800; line-height: 1.15;
+      letter-spacing: -0.01em;
+      margin-bottom: 0.25rem;
+    }
+    .info-sheet .info-section {
+      margin-top: 1.4rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--line);
+    }
+    .info-sheet .info-section-label {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      color: var(--muted);
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+    .info-sheet .info-section-label::before {
+      content: ''; width: 14px; height: 1px;
+      background: currentColor;
+    }
+    .info-sheet p { margin-top: 0.5rem; line-height: 1.55; color: var(--text); }
+    .info-sheet p:first-child { margin-top: 0; }
+    .info-sheet ul { margin-top: 0.5rem; }
+    .info-sheet li { line-height: 1.55; color: var(--text); }
+    .info-sheet code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      background: var(--ink-3);
+      padding: 1px 5px;
+      border-radius: 3px;
+      color: var(--cyan);
+    }
+    .info-sheet a {
+      color: var(--cyan);
+      text-decoration: underline;
+      text-decoration-color: rgba(0,245,255,0.4);
+      text-underline-offset: 3px;
+    }
+    .info-sheet a:hover { text-decoration-color: var(--cyan); }
+    .info-close {
+      position: absolute; top: 14px; right: 14px;
+      width: 32px; height: 32px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 18px; line-height: 1;
+    }
+    .info-close:hover { color: var(--magenta); border-color: rgba(255,46,136,0.5); }
+    .insight-block {
+      background: rgba(0,245,255,0.05);
+      border: 1px solid rgba(0,245,255,0.2);
+      border-radius: 10px;
+      padding: 0.9rem 1rem;
+    }
+    .insight-block p { color: #d8eef5; }
   </style>
 </head>
 <body class="min-h-screen">
@@ -264,11 +376,87 @@ INDEX_HTML = """<!doctype html>
     <div id="root" class="text-[color:var(--muted)] mono text-xs">// loading vitals…</div>
   </main>
 
+  <!-- Slide-in info panel — populated from #metric-info-data on click -->
+  <div id="info-overlay" class="info-overlay" data-info-close></div>
+  <aside id="info-sheet" class="info-sheet" role="dialog" aria-modal="true" aria-labelledby="info-title">
+    <button class="info-close" data-info-close aria-label="Close info panel">×</button>
+    <h3 id="info-title">—</h3>
+    <p id="info-tagline" class="text-xs text-[color:var(--muted)] mono"></p>
+
+    <section class="info-section">
+      <div class="info-section-label">What it is</div>
+      <div id="info-what"></div>
+    </section>
+
+    <section class="info-section">
+      <div class="info-section-label">Insight · your data</div>
+      <div id="info-insight" class="insight-block"></div>
+    </section>
+
+    <section class="info-section">
+      <div class="info-section-label">Sources</div>
+      <ul id="info-sources" class="list-disc pl-5 text-sm space-y-1"></ul>
+    </section>
+  </aside>
+
   <script>
     document.body.addEventListener('htmx:afterSwap', () => {
       document.getElementById('last-refresh').textContent = new Date().toLocaleTimeString();
       renderAll();
     });
+
+    // — Info-panel wiring — open on info-button click, close on overlay/Esc/×
+    document.body.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-info]');
+      if (btn) {
+        e.preventDefault();
+        openInfo(btn.dataset.info);
+        return;
+      }
+      if (e.target.closest('[data-info-close]')) {
+        closeInfo();
+      }
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeInfo();
+    });
+
+    function readInfoData() {
+      const el = document.getElementById('metric-info-data');
+      if (!el) return {};
+      try { return JSON.parse(el.textContent); } catch { return {}; }
+    }
+
+    function openInfo(metricId) {
+      const data = readInfoData()[metricId];
+      const sheet = document.getElementById('info-sheet');
+      const overlay = document.getElementById('info-overlay');
+      if (!data) {
+        document.getElementById('info-title').textContent = 'Info coming soon';
+        document.getElementById('info-tagline').textContent = `metric: ${metricId}`;
+        document.getElementById('info-what').innerHTML =
+          '<p>This card does not yet have an info entry. Add one to <code>src/metric_info.py</code>.</p>';
+        document.getElementById('info-insight').innerHTML = '';
+        document.getElementById('info-sources').innerHTML = '';
+      } else {
+        document.getElementById('info-title').textContent = data.title;
+        document.getElementById('info-tagline').textContent = `metric_id: ${metricId}`;
+        document.getElementById('info-what').innerHTML = data.what || '';
+        document.getElementById('info-insight').innerHTML = data.insight || '';
+        document.getElementById('info-sources').innerHTML = (data.sources || [])
+          .map(s => `<li><a href="${s.url}" target="_blank" rel="noopener noreferrer">${s.title}</a></li>`)
+          .join('');
+      }
+      sheet.classList.add('open');
+      overlay.classList.add('open');
+      document.body.style.overflow = 'hidden';
+    }
+
+    function closeInfo() {
+      document.getElementById('info-sheet').classList.remove('open');
+      document.getElementById('info-overlay').classList.remove('open');
+      document.body.style.overflow = '';
+    }
 
     function $(id) { return document.getElementById(id); }
     function readJSON(id) { const el = $(id); return el ? JSON.parse(el.textContent) : null; }
@@ -833,6 +1021,11 @@ def _stat_card(label: str, value: str, sub: str = "", extra: str = "") -> str:
     )
 
 
+def _info_btn(metric_id: str) -> str:
+    """Renders the discrete ⓘ button that opens the side panel for a given metric."""
+    return f'<button class="info-btn" data-info="{metric_id}" aria-label="About this metric" title="About">i</button>'
+
+
 def _spark_card(
     label: str,
     value: str,
@@ -842,6 +1035,7 @@ def _spark_card(
     category: str = "recovery",
     countup_target: float | None = None,
     decimals: int = 0,
+    info_id: str | None = None,
 ) -> str:
     """Stat card with a 14-day sparkline behind the headline number."""
     spark_id = canvas_id + "Data"
@@ -850,8 +1044,10 @@ def _spark_card(
     if countup_target is not None:
         cu_attr = f' data-countup="{countup_target}" data-decimals="{decimals}"'
         inner_value = "0"
+    info_html = _info_btn(info_id) if info_id else ""
     return f"""
     <div class="card relative overflow-hidden" data-cat="{category}">
+      {info_html}
       <div class="stat-label">{label}</div>
       <div class="stat-num mt-1"><span{cu_attr}>{inner_value}</span></div>
       <div class="text-xs text-[color:var(--muted)] mt-1">{sub}</div>
@@ -895,6 +1091,7 @@ def _hero_html(readiness: dict, summary: dict) -> str:
 
     return f"""
     <section class="card" data-cat="recovery">
+      {_info_btn("readiness")}
       <div class="flex flex-col md:flex-row md:items-center gap-6">
         <!-- Readiness ring -->
         <div class="relative flex items-center justify-center" style="width:240px;height:240px">
@@ -968,33 +1165,39 @@ def _stats_row_html(db_path: Path, summary: dict, trends: list[dict]) -> str:
                    value="—" if rhr is None else str(rhr),
                    sub="bpm",
                    canvas_id="rhrSpark", spark_data=rhr_spark, category="recovery",
-                   countup_target=float(rhr) if rhr is not None else None)}
+                   countup_target=float(rhr) if rhr is not None else None,
+                   info_id="rhr")}
       {_spark_card("HRV",
                    value="—" if hrv is None else str(hrv),
                    sub="ms · overnight",
                    canvas_id="hrvSpark", spark_data=hrv_spark, category="recovery",
-                   countup_target=float(hrv) if hrv is not None else None)}
+                   countup_target=float(hrv) if hrv is not None else None,
+                   info_id="hrv")}
       {_spark_card("Steps",
                    value=f"{steps:,}",
                    sub="today",
                    canvas_id="stepsSpark", spark_data=steps_spark, category="training",
-                   countup_target=float(steps))}
+                   countup_target=float(steps),
+                   info_id="steps")}
       {_spark_card("Sleep",
                    value="—" if sleep_h is None else f"{sleep_h:.1f}h",
                    sub="last night",
                    canvas_id="sleepSpark", spark_data=sleep_spark, category="sleep",
-                   countup_target=sleep_h, decimals=1)}
+                   countup_target=sleep_h, decimals=1,
+                   info_id="sleep")}
       {_spark_card("Body Batt",
                    value="—" if bb is None else str(bb),
                    sub="current",
                    canvas_id="bbSparkChart", spark_data=bb_spark, category="recovery",
-                   countup_target=float(bb) if bb is not None else None)}
+                   countup_target=float(bb) if bb is not None else None,
+                   info_id="body_battery")}
       {_spark_card("Stress",
                    value="—" if stress is None else str(stress),
                    sub="avg today",
                    canvas_id="stressSpark", spark_data=[],  # no historical stress in trends
                    category="alerts",
-                   countup_target=float(stress) if stress is not None else None)}
+                   countup_target=float(stress) if stress is not None else None,
+                   info_id="stress")}
     </section>
     """
 
@@ -1006,12 +1209,14 @@ def _row3_html(trends: list[dict]) -> str:
     rhr_data = [{"date": r["date"], "value": r["resting_hr"]} for r in trends]
     return f"""
     <section class="grid md:grid-cols-2 gap-3">
-      <div class="card">
+      <div class="card" data-cat="recovery">
+        {_info_btn("hrv_trend")}
         <h2 class="font-semibold mb-2">HRV — last 30d</h2>
         <script type="application/json" id="hrvTrendData">{json.dumps(hrv_data)}</script>
         <canvas id="hrvTrendChart"></canvas>
       </div>
-      <div class="card">
+      <div class="card" data-cat="recovery">
+        {_info_btn("rhr_trend")}
         <h2 class="font-semibold mb-2">Resting HR — last 30d</h2>
         <script type="application/json" id="rhrTrendData">{json.dumps(rhr_data)}</script>
         <canvas id="rhrTrendChart"></canvas>
@@ -1029,11 +1234,13 @@ def _row4_html(stages: dict | None, sleep_dur: list[dict]) -> str:
     )
     return f"""
     <section class="grid md:grid-cols-2 gap-3">
-      <div class="card">
+      <div class="card" data-cat="sleep">
+        {_info_btn("sleep_stages")}
         <h2 class="font-semibold mb-2">Sleep stages — last night</h2>
         {stages_block}
       </div>
-      <div class="card">
+      <div class="card" data-cat="sleep">
+        {_info_btn("sleep_duration")}
         <h2 class="font-semibold mb-2">Sleep duration — last 14d</h2>
         <script type="application/json" id="sleepDurationData">{json.dumps(sleep_dur)}</script>
         <canvas id="sleepDurationChart"></canvas>
@@ -1088,7 +1295,8 @@ def _row5_html(activities: list[dict], cal_load: list[dict]) -> str:
         rows_html = "".join(rows)
     return f"""
     <section class="grid lg:grid-cols-2 gap-3">
-      <div class="card overflow-x-auto">
+      <div class="card overflow-x-auto" data-cat="training">
+        {_info_btn("activities")}
         <h2 class="font-semibold mb-2">Activities — last 14d</h2>
         <table class="w-full text-sm">
           <thead><tr class="text-gray-400 text-xs uppercase">
@@ -1103,7 +1311,8 @@ def _row5_html(activities: list[dict], cal_load: list[dict]) -> str:
           <tbody>{rows_html}</tbody>
         </table>
       </div>
-      <div class="card">
+      <div class="card" data-cat="training">
+        {_info_btn("training_load")}
         <h2 class="font-semibold mb-2">Training load — last 30d (kcal)</h2>
         <script type="application/json" id="trainingLoadData">{json.dumps(cal_load)}</script>
         <canvas id="trainingLoadChart"></canvas>
@@ -1225,6 +1434,7 @@ def _training_intel_html(intel: dict) -> str:
       <div class="grid md:grid-cols-2 lg:grid-cols-4 gap-3">
         <!-- ACWR gauge -->
         <div class="card" data-cat="training">
+          {_info_btn("acwr")}
           <div class="stat-label">ACWR · Injury Risk</div>
           {_acwr_gauge_svg(acwr_ratio, acwr_band)}
           <div class="text-xs text-[color:var(--muted)] mt-3">{acwr_sub}</div>
@@ -1232,6 +1442,7 @@ def _training_intel_html(intel: dict) -> str:
 
         <!-- Monotony -->
         <div class="card" data-cat="training">
+          {_info_btn("monotony")}
           <div class="stat-label">Training Monotony</div>
           <div class="display-num mt-3" style="font-size:4rem">{monotony_value}</div>
           <div class="pill {monotony_pill} mt-3">{monotony_label}</div>
@@ -1240,6 +1451,7 @@ def _training_intel_html(intel: dict) -> str:
 
         <!-- Z2 minutes -->
         <div class="card" data-cat="training">
+          {_info_btn("z2")}
           <div class="stat-label">Z2 Aerobic · This Week</div>
           <div class="flex items-baseline gap-2 mt-3">
             <span class="display-num" style="font-size:3rem">
@@ -1262,6 +1474,7 @@ def _training_intel_html(intel: dict) -> str:
 
         <!-- Sleep debt -->
         <div class="card" data-cat="sleep">
+          {_info_btn("sleep_debt")}
           <div class="stat-label">Sleep Debt · 7d</div>
           <div class="flex items-baseline gap-2 mt-3">
             <span class="display-num" style="font-size:3rem">
@@ -1325,6 +1538,7 @@ def _year_heatmap_html(history: list[dict]) -> str:
     <section>
       <h2 class="section-title">Annual Readiness · {len(history)}d</h2>
       <div class="card" data-cat="recovery">
+        {_info_btn("heatmap")}
         <div class="overflow-x-auto">
           <div class="flex gap-[2px] min-w-fit">
             {''.join(cols)}
@@ -1443,6 +1657,7 @@ def _energy_availability_card(ea: dict) -> str:
     if status == "unknown" or ea_value is None:
         return f"""
         <div class="card" data-cat="nutrition">
+          {_info_btn("energy_availability")}
           <div class="stat-label">Energy Availability</div>
           <div class="text-sm text-[color:var(--muted)] mt-3">
             Log meals to compute EA (kcal/kg LBM) and the RED-S threshold.
@@ -1459,6 +1674,7 @@ def _energy_availability_card(ea: dict) -> str:
     }.get(status, "")
     return f"""
     <div class="card" data-cat="nutrition">
+      {_info_btn("energy_availability")}
       <div class="stat-label">Energy Availability</div>
       <div class="display-num mt-3 {glow}" style="font-size:3.4rem">
         <span data-countup="{ea_value}" data-decimals="1">0</span>
@@ -1550,6 +1766,7 @@ def _nutrition_v2_html(
       <!-- Top row: balance summary + macros -->
       <div class="grid md:grid-cols-3 gap-3">
         <div class="card" data-cat="nutrition">
+          {_info_btn("calorie_balance")}
           <div class="stat-label">Calorie Balance</div>
           <div class="display-num mt-3" style="font-size:3.6rem">
             <span data-countup="{eaten:.0f}">0</span>
@@ -1569,6 +1786,7 @@ def _nutrition_v2_html(
         </div>
 
         <div class="card md:col-span-2" data-cat="nutrition">
+          {_info_btn("macros")}
           <div class="stat-label">Macros · Today</div>
           <div class="grid grid-cols-3 gap-2 mt-4">
             {_macro_ring_svg("Protein", protein_g, p_target, "ring-fill-p")}
@@ -1586,6 +1804,7 @@ def _nutrition_v2_html(
       <div class="grid md:grid-cols-2 gap-3 mt-3">
         {_energy_availability_card(nutrition_extras.get("energy_availability") or {})}
         <div class="card" data-cat="nutrition">
+          {_info_btn("meal_timing")}
           <div class="stat-label">Meal Timing · 24h</div>
           <div class="mt-3">
             {timing_strip}
@@ -1596,6 +1815,7 @@ def _nutrition_v2_html(
       <!-- Bottom row: 7-day balance chart + meals table -->
       <div class="grid md:grid-cols-2 gap-3 mt-3">
         <div class="card" data-cat="nutrition">
+          {_info_btn("balance_history")}
           <div class="stat-label">Calorie Balance · 7 Days</div>
           <div style="height:180px" class="mt-3">
             <script type="application/json" id="balanceData">{json.dumps(history_7d)}</script>
@@ -1631,7 +1851,8 @@ def _row7_html(alerts_list: list[dict]) -> str:
             )
         body = f'<ul class="space-y-2">{"".join(items)}</ul>'
     return f"""
-    <section class="card">
+    <section class="card" data-cat="alerts">
+      {_info_btn("alerts")}
       <h2 class="font-semibold mb-2">Recent alerts</h2>
       {body}
     </section>
@@ -1687,8 +1908,33 @@ def render_full(cfg: Config) -> str:
 
     alerts_list = get_alerts(cfg.db_path, 10)
 
+    info_ctx = {
+        "cfg": cfg,
+        "summary": summary,
+        "readiness": readiness_v2,
+        "acwr": intel["acwr"],
+        "monotony": intel["monotony"],
+        "z2": intel["z2"],
+        "sleep_debt": intel["sleep_debt"],
+        "balance": today_balance,
+        "meals": today_meals,
+        "protein_target_g": nutrition_extras["protein_target_g"],
+        "fiber_target_g": nutrition_extras["fiber_target_g"],
+        "energy_availability": nutrition_extras["energy_availability"],
+        "meal_timing": nutrition_extras["meal_timing"],
+        "history_7d": history_7d,
+        "heatmap": heatmap,
+        "activities": activities,
+    }
+    info_payload = metric_info.build_payload(info_ctx)
+    info_block = (
+        f'<script type="application/json" id="metric-info-data">'
+        f'{json.dumps(info_payload)}</script>'
+    )
+
     return "\n".join(
         [
+            info_block,
             _hero_html(readiness_v2, summary),
             _stats_row_html(cfg.db_path, summary, trends),
             _training_intel_html(intel),
