@@ -219,6 +219,18 @@ def recent_hrv_overnight(db_path: Path, days: int) -> list[tuple[str, int]]:
     return [(r[0], int(r[1])) for r in reversed(rows)]
 
 
+def recent_daily_metrics(db_path: Path, days: int) -> list[dict]:
+    """Return last `days` rows of (date, resting_hr, hrv_overnight) — oldest first."""
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT date, resting_hr, hrv_overnight FROM daily_summary "
+            "ORDER BY date DESC LIMIT ?",
+            (days,),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
 def avg_hr_between(db_path: Path, start_iso: str, end_iso: str) -> tuple[float, int] | None:
     """(avg_bpm, sample_count) from hr_realtime within an ISO UTC window. None if no rows."""
     with connect(db_path) as conn:

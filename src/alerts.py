@@ -32,17 +32,25 @@ def send_telegram(cfg: Config, text: str) -> bool:
 _send_telegram = send_telegram  # back-compat alias
 
 
-def maybe_alert(cfg: Config, kind: str, text: str, payload: dict | None = None) -> bool:
+def maybe_alert(
+    cfg: Config,
+    kind: str,
+    text: str,
+    payload: dict | None = None,
+    *,
+    cooldown_seconds: int | None = None,
+) -> bool:
     """Send a Telegram alert if the cooldown for this kind has elapsed.
 
     Returns True if a message was sent, False if suppressed or failed.
     """
+    cooldown = cooldown_seconds if cooldown_seconds is not None else cfg.alert_cooldown_seconds
     last = db.last_alert_ts(cfg.db_path, kind)
     if last is not None:
         elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-        if elapsed < cfg.alert_cooldown_seconds:
+        if elapsed < cooldown:
             log.debug("Alert '%s' suppressed (cooldown %.0fs remaining)",
-                      kind, cfg.alert_cooldown_seconds - elapsed)
+                      kind, cooldown - elapsed)
             return False
 
     sent = send_telegram(cfg, text)

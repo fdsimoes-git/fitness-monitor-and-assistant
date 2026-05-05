@@ -35,6 +35,21 @@ HRV_MIN_BASELINE_SAMPLES = 4  # avoid spurious alerts after a few days of data
 # HR-while-resting params
 REST_WINDOW_MIN_SAMPLES = 10  # need this many BLE points to trust the avg
 
+# Illness / overtraining (Buchheit 2014, Plews 2013): RHR ↑ AND HRV ↓ on 2+ days.
+ILLNESS_BASELINE_DAYS = 7
+ILLNESS_RHR_RISE_FRACTION = 0.05  # 5%
+ILLNESS_HRV_DROP_FRACTION = 0.10  # 10%
+ILLNESS_CONSECUTIVE_DAYS = 2
+ILLNESS_MIN_BASELINE_SAMPLES = 4
+
+# Optimal training window (Kiviniemi 2007): HRV ±10% vs 7-day baseline.
+TRAINING_BASELINE_DAYS = 7
+TRAINING_HRV_FRACTION = 0.10
+TRAINING_MIN_BASELINE_SAMPLES = 4
+
+# Cooldown so the daily-readiness alerts fire at most once per day.
+ONCE_PER_DAY_SECONDS = 22 * 3600
+
 
 def _is_strictly_increasing(values: list[int]) -> bool:
     return len(values) >= 2 and all(b > a for a, b in zip(values, values[1:]))
@@ -152,9 +167,121 @@ def check_hr_while_resting(cfg: Config, *, now: datetime | None = None) -> bool:
     )
 
 
+def _baseline_mean(rows: list[dict], key: str) -> float | None:
+    vals = [r[key] for r in rows if r.get(key) is not None]
+    if len(vals) < ILLNESS_MIN_BASELINE_SAMPLES:
+        return None
+    return sum(vals) / len(vals)
+
+
+def check_illness_risk(cfg: Config) -> bool:
+    """Two consecutive days of RHR ↑>5% AND HRV ↓>10% vs preceding 7-day mean."""
+    needed = ILLNESS_BASELINE_DAYS + ILLNESS_CONSECUTIVE_DAYS
+    rows = db.recent_daily_metrics(cfg.db_path, needed)
+    if len(rows) < needed:
+        return False
+
+    streak: list[dict] = []
+    for i in range(ILLNESS_CONSECUTIVE_DAYS):
+        idx = len(rows) - 1 - i  # walk back from most-recent day
+        baseline_rows = rows[idx - ILLNESS_BASELINE_DAYS:idx]
+        rhr_baseline = _baseline_mean(baseline_rows, "resting_hr")
+        hrv_baseline = _baseline_mean(baseline_rows, "hrv_overnight")
+        if not rhr_baseline or not hrv_baseline:
+            return False
+
+        today_rhr = rows[idx].get("resting_hr")
+        today_hrv = rows[idx].get("hrv_overnight")
+        if today_rhr is None or today_hrv is None:
+            return False
+
+        rhr_rise = (today_rhr - rhr_baseline) / rhr_baseline
+        hrv_drop = (hrv_baseline - today_hrv) / hrv_baseline
+        if rhr_rise > ILLNESS_RHR_RISE_FRACTION and hrv_drop > ILLNESS_HRV_DROP_FRACTION:
+            streak.append({
+                "date": rows[idx]["date"],
+                "rhr_rise": rhr_rise,
+                "hrv_drop": hrv_drop,
+            })
+        else:
+            return False  # streak broken
+
+    if len(streak) < ILLNESS_CONSECUTIVE_DAYS:
+        return False
+
+    latest = streak[0]
+    text = (
+        f"⚠️ *Recovery alert*: your RHR is *{latest['rhr_rise'] * 100:.0f}%* "
+        f"above baseline and HRV is *{latest['hrv_drop'] * 100:.0f}%* below baseline "
+        f"for *{len(streak)}* days. Consider rest or check for illness."
+    )
+    return alerts.maybe_alert(
+        cfg,
+        kind="illness_risk",
+        text=text,
+        payload={"days": len(streak), "streak": streak},
+        cooldown_seconds=ONCE_PER_DAY_SECONDS,
+    )
+
+
+def check_training_window(cfg: Config) -> bool:
+    """Compare today's HRV to 7-day baseline; fire 'training_ready' or 'recovery_day'."""
+    rows = db.recent_daily_metrics(cfg.db_path, TRAINING_BASELINE_DAYS + 1)
+    if len(rows) < TRAINING_BASELINE_DAYS + 1:
+        return False
+    *baseline_rows, today_row = rows
+    today_hrv = today_row.get("hrv_overnight")
+    if today_hrv is None:
+        return False
+    hrv_baseline = _baseline_mean(baseline_rows, "hrv_overnight")
+    if not hrv_baseline:
+        return False
+
+    delta = (today_hrv - hrv_baseline) / hrv_baseline
+    payload = {
+        "date": today_row["date"],
+        "hrv": today_hrv,
+        "baseline": hrv_baseline,
+        "delta": delta,
+    }
+
+    if delta >= TRAINING_HRV_FRACTION:
+        text = (
+            f"💪 Great recovery today (HRV *+{delta * 100:.0f}%* vs baseline). "
+            f"Good day for intense training."
+        )
+        return alerts.maybe_alert(
+            cfg,
+            kind="training_ready",
+            text=text,
+            payload=payload,
+            cooldown_seconds=ONCE_PER_DAY_SECONDS,
+        )
+    if delta <= -TRAINING_HRV_FRACTION:
+        text = (
+            f"🔄 Low HRV today (*{delta * 100:.0f}%* vs baseline). "
+            f"Prioritize recovery or light activity."
+        )
+        return alerts.maybe_alert(
+            cfg,
+            kind="recovery_day",
+            text=text,
+            payload=payload,
+            cooldown_seconds=ONCE_PER_DAY_SECONDS,
+        )
+    return False
+
+
 def run_smart_alerts(cfg: Config) -> None:
     """Run all checks in sequence. Failures in one don't block the others."""
-    for fn in (check_resting_hr_trend, check_hrv_drop, check_hr_while_resting):
+    checks = (
+        check_resting_hr_trend,
+        check_hrv_drop,
+        check_hr_while_resting,
+        check_illness_risk,
+        check_training_window,
+    )
+    for fn in checks:
         try:
             fn(cfg)
         except Exception as e:  # noqa: BLE001 — alerts must not break the poll
