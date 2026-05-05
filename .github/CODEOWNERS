@@ -1,0 +1,5 @@
+# Code owners for garmin-monitor.
+# Order matters — the LAST matching pattern takes precedence.
+# Required reviews are enforced by branch protection on `main`.
+
+*       @fdsimoes-git
