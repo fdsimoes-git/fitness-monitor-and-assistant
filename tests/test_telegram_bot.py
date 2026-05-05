@@ -145,8 +145,10 @@ def test_dispatch_today_command_pulls_balance(tmpdb):
 # ── text → barcode auto-insert ────────────────────────────────────────────
 
 
-def test_dispatch_routes_numeric_to_barcode_lookup(tmpdb):
+def test_dispatch_routes_numeric_to_barcode_lookup_and_proposes(tmpdb):
+    """Numeric barcode → OFF lookup → Confirm/Cancel keyboard. No DB write yet."""
     cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
     info = {
         "name": "Coca-Cola 330ml",
         "kcal_100g": 42, "protein_100g": 0, "carbs_100g": 10.6, "fat_100g": 0,
@@ -155,52 +157,105 @@ def test_dispatch_routes_numeric_to_barcode_lookup(tmpdb):
         "serving_size_g": 330,
     }
     with patch("src.telegram_bot.food.lookup_barcode", return_value=info) as mock_lookup, \
-         patch("src.telegram_bot.alerts.send_telegram") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="5449000000996"), {})
+         patch("src.telegram_bot._send_with_keyboard") as mock_kb:
+        telegram_bot.dispatch(cfg, _msg(text="5449000000996"), pending)
     mock_lookup.assert_called_once_with("5449000000996")
-    rows = db.meals_for_date(tmpdb, date.today().isoformat())
-    assert len(rows) == 1
-    # We ship via plain-text sender, not alerts.send_telegram, so no markdown call.
-    # Confirm something was sent through the plain-text route:
-    # (it's _send_plain → requests.post; skip checking that here, just confirm DB.)
+    # Nothing inserted yet — proposal is in pending.
+    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
+    assert len(pending) == 1
+    proposed = next(iter(pending.values()))["meal"]
+    assert proposed["barcode"] == "5449000000996"
+    # Keyboard contains both Confirm and Cancel.
+    kb = mock_kb.call_args.args[2]
+    assert any("confirm:" in b["callback_data"] for b in kb[0])
+    assert any("cancel:" in b["callback_data"] for b in kb[0])
 
 
 def test_dispatch_replies_when_barcode_not_in_off(tmpdb):
     cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
     with patch("src.telegram_bot.food.lookup_barcode", return_value=None), \
          patch("src.telegram_bot._send_plain") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="9999999999"), {})
+        telegram_bot.dispatch(cfg, _msg(text="9999999999"), pending)
     mock_send.assert_called_once()
     assert "not found" in mock_send.call_args.args[1]
+    assert pending == {}
     assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
 
 
 # ── text → claude extraction ──────────────────────────────────────────────
 
 
-def test_dispatch_routes_text_to_llm_and_inserts_meal(tmpdb):
+def test_dispatch_routes_text_to_llm_and_proposes_confirmation(tmpdb):
+    """Free-text → Claude extraction → Confirm/Cancel keyboard. No DB write yet."""
     cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
     extracted = {"description": "tuna sandwich", "kcal": 480, "protein_g": 28, "carbs_g": 50, "fat_g": 15}
     with patch("src.telegram_bot.llm.extract_meal_from_text", return_value=extracted) as mock_llm, \
-         patch("src.telegram_bot._send_plain") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="tuna sandwich on whole wheat"), {})
+         patch("src.telegram_bot._send_with_keyboard") as mock_kb:
+        telegram_bot.dispatch(cfg, _msg(text="tuna sandwich on whole wheat"), pending)
     mock_llm.assert_called_once()
-    rows = db.meals_for_date(tmpdb, date.today().isoformat())
-    assert len(rows) == 1
-    assert rows[0]["description"] == "tuna sandwich"
-    assert rows[0]["source"] == "text"
-    mock_send.assert_called_once()
-    assert "Logged" in mock_send.call_args.args[1]
+    # Nothing in the DB yet; proposal lives in pending.
+    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
+    assert len(pending) == 1
+    proposed = next(iter(pending.values()))["meal"]
+    assert proposed["description"] == "tuna sandwich"
+    assert proposed["source"] == "text"
+    kb = mock_kb.call_args.args[2]
+    assert any("confirm:" in b["callback_data"] for b in kb[0])
+    assert any("cancel:" in b["callback_data"] for b in kb[0])
 
 
 def test_dispatch_replies_when_llm_returns_none(tmpdb):
     cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
     with patch("src.telegram_bot.llm.extract_meal_from_text", return_value=None), \
          patch("src.telegram_bot._send_plain") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="??"), {})
+        telegram_bot.dispatch(cfg, _msg(text="??"), pending)
     mock_send.assert_called_once()
     assert "couldn't" in mock_send.call_args.args[1].lower()
+    assert pending == {}
     assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
+
+
+def test_text_confirm_round_trip_inserts_meal(tmpdb):
+    """End-to-end: free-text → propose → tap ✅ → row appears."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    extracted = {"description": "yogurt with granola", "kcal": 320, "protein_g": 12,
+                 "carbs_g": 45, "fat_g": 9, "source": "text"}
+    with patch("src.telegram_bot.llm.extract_meal_from_text", return_value=extracted), \
+         patch("src.telegram_bot._send_with_keyboard"):
+        telegram_bot.dispatch(cfg, _msg(text="yogurt with granola"), pending)
+    pid = next(iter(pending))
+    with patch("src.telegram_bot._answer_callback"), \
+         patch("src.telegram_bot._edit_message_remove_keyboard"):
+        telegram_bot.dispatch(cfg, _callback(f"confirm:{pid}"), pending)
+    rows = db.meals_for_date(tmpdb, date.today().isoformat())
+    assert len(rows) == 1
+    assert rows[0]["description"] == "yogurt with granola"
+    assert rows[0]["source"] == "text"
+    assert pending == {}
+
+
+def test_barcode_cancel_round_trip_drops_proposal(tmpdb):
+    """Barcode → proposal → tap ❌ → DB stays empty."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    info = {
+        "name": "Snack bar", "kcal_100g": 380, "protein_100g": 6, "carbs_100g": 55,
+        "fat_100g": 14, "fiber_100g": 2, "sugars_100g": 30, "saturated_fat_100g": 7,
+        "sodium_mg_100g": 120, "food_category": "Sugary snacks", "serving_size_g": 40,
+    }
+    with patch("src.telegram_bot.food.lookup_barcode", return_value=info), \
+         patch("src.telegram_bot._send_with_keyboard"):
+        telegram_bot.dispatch(cfg, _msg(text="1234567890123"), pending)
+    pid = next(iter(pending))
+    with patch("src.telegram_bot._answer_callback"), \
+         patch("src.telegram_bot._edit_message_remove_keyboard"):
+        telegram_bot.dispatch(cfg, _callback(f"cancel:{pid}"), pending)
+    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
+    assert pending == {}
 
 
 # ── photo flow ────────────────────────────────────────────────────────────

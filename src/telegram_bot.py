@@ -49,9 +49,9 @@ BARCODE_PATTERN = re.compile(r"^\d{8,14}$")
 
 HELP_TEXT = (
     "*garmin-monitor bot*\n\n"
-    "Log meals — send any of:\n"
+    "Log meals — send any of (I'll always ask before saving):\n"
     "• A meal description (e.g. _\"oat porridge with banana, ~350 kcal\"_)\n"
-    "• A *photo* of your food or a packaged product (Confirm/Cancel before logging)\n"
+    "• A *photo* of your food or a packaged product\n"
     "• A product *barcode* (8–14 digits)\n\n"
     "Ask questions about your data:\n"
     "• `/ask How's my protein this week?`\n"
@@ -163,7 +163,7 @@ def _is_whitelisted(cfg: Config, chat_id: Any) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _handle_text(cfg: Config, msg: dict, _pending: dict[str, dict[str, Any]]) -> None:
+def _handle_text(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) -> None:
     text = (msg.get("text") or "").strip()
     if not text:
         return
@@ -179,7 +179,7 @@ def _handle_text(cfg: Config, msg: dict, _pending: dict[str, dict[str, Any]]) ->
         _handle_ask(cfg, text)
         return
     if BARCODE_PATTERN.match(text):
-        _log_barcode_auto(cfg, text)
+        _propose_barcode(cfg, text, pending)
         return
 
     meal = llm.extract_meal_from_text(cfg, text)
@@ -187,9 +187,7 @@ def _handle_text(cfg: Config, msg: dict, _pending: dict[str, dict[str, Any]]) ->
         _send_plain(cfg, "Sorry — I couldn't extract a meal from that. Try /help.")
         return
     meal.setdefault("source", "text")
-    mid = db.insert_meal(cfg.db_path, meal)
-    log.info("Inserted meal #%s from text", mid)
-    _send_plain(cfg, f"Logged: {_format_meal_summary(meal)}")
+    _offer_confirmation(cfg, meal, pending)
 
 
 def _handle_ask(cfg: Config, raw: str) -> None:
@@ -213,14 +211,13 @@ def _handle_ask(cfg: Config, raw: str) -> None:
     _send_plain(cfg, answer)
 
 
-def _log_barcode_auto(cfg: Config, barcode: str) -> None:
+def _propose_barcode(cfg: Config, barcode: str, pending: dict[str, dict[str, Any]]) -> None:
     info = food.lookup_barcode(barcode)
     if info is None:
         _send_plain(cfg, f"Barcode {barcode} not found in Open Food Facts.")
         return
     meal = food.meal_from_barcode_info(info, barcode)
-    db.insert_meal(cfg.db_path, meal)
-    _send_plain(cfg, f"Logged barcode {barcode} — {_format_meal_summary(meal)}")
+    _offer_confirmation(cfg, meal, pending)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

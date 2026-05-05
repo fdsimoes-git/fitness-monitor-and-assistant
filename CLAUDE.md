@@ -93,10 +93,11 @@ All frontend assets (Tailwind, Chart.js, htmx) come from CDN — no build step.
 
 `src/telegram_bot.py` runs a long-poll loop against Telegram's Bot API and dispatches inbound messages on a single chat (whitelisted via `TELEGRAM_CHAT_ID`):
 
-- **Text** → `llm.extract_meal_from_text` (Claude with `record_meal` tool forced) → `db.insert_meal` → reply.
-- **Numeric `^\d{8,14}$`** → `food.lookup_barcode` → `food.meal_from_barcode_info` → `db.insert_meal` → reply.
-- **Photo** → `getFile` → `llm.extract_meal_from_photo` (Claude vision with two tools: `record_meal` + `extract_barcode`). If a barcode is in frame, route through OFF; otherwise use the visual estimate. Either way, surface a Confirm/Cancel inline keyboard before persisting.
-- **`callback_query`** → confirm/cancel against an in-process `pending` dict.
+- **All meal-logging paths surface a Confirm/Cancel inline keyboard before any `db.insert_meal` runs.** Text, numeric-barcode, photo (visual), and photo (barcode-extracted) all go through the same `_offer_confirmation` helper. Nothing is persisted until the user taps ✅.
+- **Text** → `llm.extract_meal_from_text` (Claude with `record_meal` tool forced) → `_offer_confirmation` → keyboard.
+- **Numeric `^\d{8,14}$`** → `food.lookup_barcode` → `food.meal_from_barcode_info` → `_offer_confirmation` → keyboard.
+- **Photo** → `getFile` → `llm.extract_meal_from_photo` (Claude vision with two tools: `record_meal` + `extract_barcode`). If a barcode is in frame, route through OFF; otherwise use the visual estimate. Either way, `_offer_confirmation` surfaces the keyboard.
+- **`callback_query`** → confirm/cancel against an in-process `pending` dict (keyed by short UUID, swept after 1h). Confirm → `db.insert_meal`; Cancel → drop.
 - **`/help`, `/today`, `/balance`** → static help / today's calorie balance.
 - **`/ask <question>` (alias `/chat`)** → `llm.chat`, an agentic tool-use loop with eight read-only DB tools (`get_balance`, `get_meals`, `get_recent_meals`, `get_daily_summary`, `get_trends`, `get_activities`, `get_readiness`, `get_training_intel`). Claude can chain calls; the loop is capped at `CHAT_MAX_ITERATIONS=6`. The system prompt includes today's date so Claude can resolve relative time ("yesterday", "this week") to ISO dates before calling tools.
 
