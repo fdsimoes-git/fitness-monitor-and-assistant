@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -66,6 +66,21 @@ CREATE TABLE IF NOT EXISTS activities (
     fetched_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
+
+CREATE TABLE IF NOT EXISTS meals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at       TEXT NOT NULL,    -- ISO8601 UTC, when row was created
+    meal_time       TEXT NOT NULL,    -- ISO8601 UTC, actual meal time
+    description     TEXT NOT NULL,
+    source          TEXT NOT NULL,    -- 'photo' | 'barcode' | 'manual'
+    barcode         TEXT,
+    kcal            REAL,
+    protein_g       REAL,
+    carbs_g         REAL,
+    fat_g           REAL,
+    raw_json        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_meals_meal_time ON meals(meal_time);
 """
 
 
@@ -185,6 +200,84 @@ def activities_for_date(db_path: Path, date_iso: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def insert_meal(db_path: Path, meal: dict) -> int:
+    """Insert one meal row. Returns the new row id.
+
+    Required keys: `description`, `source`. `meal_time` defaults to now (UTC),
+    `logged_at` is always now. Other macro/kcal fields are optional.
+    """
+    if not meal.get("description"):
+        raise ValueError("insert_meal requires description")
+    if not meal.get("source"):
+        raise ValueError("insert_meal requires source")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    values = {
+        "logged_at": now,
+        "meal_time": meal.get("meal_time") or now,
+        "description": meal["description"],
+        "source": meal["source"],
+        "barcode": meal.get("barcode"),
+        "kcal": meal.get("kcal"),
+        "protein_g": meal.get("protein_g"),
+        "carbs_g": meal.get("carbs_g"),
+        "fat_g": meal.get("fat_g"),
+        "raw_json": meal.get("raw_json"),
+    }
+    columns_sql = ", ".join(values.keys())
+    placeholders = ", ".join(f":{k}" for k in values)
+    with connect(db_path) as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                f"INSERT INTO meals ({columns_sql}) VALUES ({placeholders})",
+                values,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return int(cur.lastrowid)
+
+
+def meals_for_date(db_path: Path, date_iso: str) -> list[dict]:
+    """Return meals whose `meal_time` falls on the given local date, oldest first."""
+    start = datetime.combine(date.fromisoformat(date_iso), time(0, 0)).astimezone()
+    end = start + timedelta(days=1)
+    start_iso = start.astimezone(timezone.utc).isoformat(timespec="seconds")
+    end_iso = end.astimezone(timezone.utc).isoformat(timespec="seconds")
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM meals WHERE meal_time >= ? AND meal_time < ? "
+            "ORDER BY meal_time ASC, id ASC",
+            (start_iso, end_iso),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def calorie_balance_for_date(db_path: Path, date_iso: str) -> dict:
+    """Eaten kcal/macros from meals + burned kcal from activities for one local date."""
+    meals = meals_for_date(db_path, date_iso)
+    eaten = sum(m["kcal"] for m in meals if m.get("kcal") is not None)
+    protein = sum(m["protein_g"] for m in meals if m.get("protein_g") is not None)
+    carbs = sum(m["carbs_g"] for m in meals if m.get("carbs_g") is not None)
+    fat = sum(m["fat_g"] for m in meals if m.get("fat_g") is not None)
+
+    activities = activities_for_date(db_path, date_iso)
+    burned = sum(a["calories"] for a in activities if a.get("calories") is not None)
+
+    return {
+        "date": date_iso,
+        "eaten_kcal": round(eaten, 1) if eaten else 0.0,
+        "burned_kcal": int(burned),
+        "balance_kcal": round(eaten - burned, 1),
+        "protein_g": round(protein, 1) if protein else 0.0,
+        "carbs_g": round(carbs, 1) if carbs else 0.0,
+        "fat_g": round(fat, 1) if fat else 0.0,
+        "meal_count": len(meals),
+    }
+
+
 def log_alert(
     db_path: Path,
     kind: str,
@@ -285,12 +378,14 @@ def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
         deleted[table] = cur.rowcount or 0
     cur = con.execute("DELETE FROM activities WHERE date < ?", (cutoff_date,))
     deleted["activities"] = cur.rowcount or 0
+    cur = con.execute("DELETE FROM meals WHERE meal_time < ?", (cutoff_ts,))
+    deleted["meals"] = cur.rowcount or 0
     con.execute("VACUUM")
     log.info(
         "Pruned rows older than %s (cutoff_ts=%s cutoff_date=%s): "
-        "hr_realtime=%d hrv=%d activities=%d",
+        "hr_realtime=%d hrv=%d activities=%d meals=%d",
         f"{days}d", cutoff_ts, cutoff_date,
-        deleted["hr_realtime"], deleted["hrv"], deleted["activities"],
+        deleted["hr_realtime"], deleted["hrv"], deleted["activities"], deleted["meals"],
     )
     return deleted
 

@@ -85,7 +85,8 @@ def main(argv: list[str] | None = None) -> int:
             deleted = db.prune_old_data(conn, days=args.days)
         print(
             f"Pruned (>{args.days}d): hr_realtime={deleted['hr_realtime']} "
-            f"hrv={deleted['hrv']} activities={deleted['activities']}"
+            f"hrv={deleted['hrv']} activities={deleted['activities']} "
+            f"meals={deleted['meals']}"
         )
         return 0
 
