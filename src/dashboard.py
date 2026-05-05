@@ -124,6 +124,26 @@ INDEX_HTML = """<!doctype html>
       renderTrainingLoad();
       renderScatter();
       renderBodyBatterySpark();
+      renderMacros();
+    }
+
+    function renderMacros() {
+      const data = readJSON('macrosData');
+      destroyChart('macrosChart');
+      const ctx = $('macrosChart');
+      if (!ctx || !data) return;
+      charts.macrosChart = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Protein (g)', 'Carbs (g)', 'Fat (g)'],
+          datasets: [{
+            data: [data.protein_g, data.carbs_g, data.fat_g],
+            backgroundColor: ['#34d399', '#fbbf24', '#f87171'],
+            borderColor: '#0b1020',
+          }],
+        },
+        options: { animation: false, plugins: { legend: { labels: { color: '#e5e7eb' } } } },
+      });
     }
 
     function renderHR() {
@@ -747,6 +767,87 @@ def _row6_html(readiness: dict, scatter: list[dict]) -> str:
     """
 
 
+def _meal_time_local(meal_time: str | None) -> str:
+    if not meal_time:
+        return "—"
+    try:
+        return datetime.fromisoformat(meal_time).astimezone().strftime("%H:%M")
+    except (TypeError, ValueError):
+        return meal_time[11:16] if len(meal_time) >= 16 else meal_time
+
+
+def _nutrition_row_html(balance: dict, meals: list[dict]) -> str:
+    eaten = balance.get("eaten_kcal") or 0
+    burned = balance.get("burned_kcal") or 0
+    bal = balance.get("balance_kcal") or 0
+    sign_label = "surplus" if bal >= 0 else "deficit"
+    sign_color = (
+        "bg-amber-900/60 text-amber-300" if bal >= 0
+        else "bg-emerald-900/60 text-emerald-300"
+    )
+    bal_text = f"{bal:+.0f} kcal {sign_label}"
+
+    meals_block: str
+    if not meals:
+        meals_block = '<p class="text-gray-500 text-sm">No meals logged today.</p>'
+    else:
+        items = []
+        for m in meals:
+            t = _meal_time_local(m.get("meal_time"))
+            kcal = m.get("kcal")
+            kcal_str = f"{kcal:.0f} kcal" if kcal is not None else "— kcal"
+            items.append(
+                "<tr class='border-t border-gray-800'>"
+                f"<td class='py-1 pr-3 text-gray-400 w-16'>{t}</td>"
+                f"<td class='py-1 pr-3'>{m.get('description') or '—'}</td>"
+                f"<td class='py-1 pr-3 text-right text-gray-300 whitespace-nowrap'>{kcal_str}</td>"
+                "</tr>"
+            )
+        meals_block = (
+            "<table class='w-full text-sm'>"
+            "<thead><tr class='text-gray-400 text-xs uppercase'>"
+            "<th class='text-left pr-3'>Time</th>"
+            "<th class='text-left pr-3'>Meal</th>"
+            "<th class='text-right pr-3'>kcal</th>"
+            f"</tr></thead><tbody>{''.join(items)}</tbody></table>"
+        )
+
+    macros_payload = {
+        "protein_g": balance.get("protein_g") or 0,
+        "carbs_g": balance.get("carbs_g") or 0,
+        "fat_g": balance.get("fat_g") or 0,
+    }
+    macros_total = sum(macros_payload.values())
+    macros_block = (
+        f'<script type="application/json" id="macrosData">{json.dumps(macros_payload)}</script>'
+        f'<canvas id="macrosChart"></canvas>'
+        if macros_total > 0
+        else '<p class="text-gray-500 text-sm">No macros logged yet.</p>'
+    )
+
+    return f"""
+    <section class="space-y-3">
+      <h2 class="font-semibold text-lg">🍽️ Nutrition — Today</h2>
+      <div class="grid md:grid-cols-3 gap-3">
+        <div class="card">
+          <div class="stat-label">Calorie balance</div>
+          <div class="stat-num">{eaten:.0f} <span class="text-base text-gray-400">kcal in</span></div>
+          <div class="text-xs text-gray-400">Burned (activities): {burned} kcal</div>
+          <span class="badge mt-2 {sign_color}">{bal_text}</span>
+        </div>
+        <div class="card">
+          <h3 class="font-semibold mb-2 text-sm">Macros</h3>
+          {macros_block}
+        </div>
+        <div class="card overflow-x-auto">
+          <h3 class="font-semibold mb-2 text-sm">Meals</h3>
+          {meals_block}
+        </div>
+      </div>
+    </section>
+    """
+
+
 def _row7_html(alerts_list: list[dict]) -> str:
     if not alerts_list:
         body = '<p class="text-gray-500 text-sm">No alerts yet.</p>'
@@ -808,6 +909,10 @@ def render_full(cfg: Config) -> str:
     ]
     alerts_list = get_alerts(cfg.db_path, 10)
 
+    today_iso = _today_iso()
+    today_meals = db.meals_for_date(cfg.db_path, today_iso)
+    today_balance = db.calorie_balance_for_date(cfg.db_path, today_iso)
+
     return "\n".join(
         [
             _row1_html(summary, bb_spark),
@@ -816,6 +921,7 @@ def render_full(cfg: Config) -> str:
             _row4_html(stages, sleep_dur),
             _row5_html(activities, cal_load),
             _row6_html(readiness, scatter),
+            _nutrition_row_html(today_balance, today_meals),
             _row7_html(alerts_list),
         ]
     )
@@ -859,6 +965,16 @@ def create_app(cfg: Config) -> "FastAPI":
     @app.get("/api/readiness")
     def api_readiness() -> JSONResponse:
         return JSONResponse(get_readiness(cfg.db_path))
+
+    @app.get("/api/meals")
+    def api_meals(date: str | None = None) -> JSONResponse:
+        target = date or _today_iso()
+        return JSONResponse(db.meals_for_date(cfg.db_path, target))
+
+    @app.get("/api/calorie-balance")
+    def api_calorie_balance(date: str | None = None) -> JSONResponse:
+        target = date or _today_iso()
+        return JSONResponse(db.calorie_balance_for_date(cfg.db_path, target))
 
     return app
 
