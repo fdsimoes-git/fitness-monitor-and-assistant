@@ -226,6 +226,46 @@ def insert_meal(db_path: Path, meal: dict) -> int:
     return int(cur.lastrowid)
 
 
+def get_meal_by_id(db_path: Path, meal_id: int) -> dict | None:
+    """Fetch a single meal row by primary key."""
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM meals WHERE id = ?", (int(meal_id),)).fetchone()
+    return dict(row) if row else None
+
+
+# Columns on `meals` that the chat-driven edit tool is allowed to mutate.
+_EDITABLE_MEAL_COLUMNS = {
+    "description", "kcal", "protein_g", "carbs_g", "fat_g",
+    "fiber_g", "sugars_g", "saturated_fat_g", "sodium_mg",
+    "food_category", "meal_time",
+}
+
+
+def update_meal(db_path: Path, meal_id: int, fields: dict) -> bool:
+    """Partial update of a meal row. Only columns in `_EDITABLE_MEAL_COLUMNS` are
+    applied; unknown keys are silently dropped (the tool layer is the validator).
+
+    Returns True if a row was updated, False if no row matched the id or no
+    valid fields were supplied.
+    """
+    payload = {k: v for k, v in (fields or {}).items() if k in _EDITABLE_MEAL_COLUMNS}
+    if not payload:
+        return False
+    set_sql = ", ".join(f"{k} = :{k}" for k in payload)
+    payload["meal_id"] = int(meal_id)
+    with connect(db_path) as conn:
+        cur = conn.execute(f"UPDATE meals SET {set_sql} WHERE id = :meal_id", payload)
+    return (cur.rowcount or 0) > 0
+
+
+def delete_meal(db_path: Path, meal_id: int) -> bool:
+    """Delete one meal row. Returns True if a row was removed."""
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM meals WHERE id = ?", (int(meal_id),))
+    return (cur.rowcount or 0) > 0
+
+
 def meals_for_date(db_path: Path, date_iso: str) -> list[dict]:
     """Return meals whose `meal_time` falls on the given local date, oldest first."""
     start = datetime.combine(date.fromisoformat(date_iso), time(0, 0)).astimezone()

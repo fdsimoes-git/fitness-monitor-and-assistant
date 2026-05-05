@@ -1,8 +1,16 @@
-"""Tests for src/telegram_bot.py.
+"""Tests for src/telegram_bot.py — chat-first architecture.
 
-Every outbound HTTP call (Telegram, Anthropic, Open Food Facts) is mocked.
-The tests poke `dispatch()` directly with synthetic Telegram update payloads
-rather than spinning up the long-poll loop.
+Every Telegram, Anthropic, and Open Food Facts call is mocked. The tests
+poke `dispatch()` directly with synthetic Telegram update payloads rather
+than spinning up the long-poll loop.
+
+After the chat-first refactor:
+- Plain text and photos default to `llm.chat()` with the full 12-tool surface.
+- Write tools (log_meal/edit_meal/delete_meal) park proposals in `pending`
+  via `llm._stash_pending`; the bot diffs `pending` before/after each chat
+  call and surfaces a Confirm/Cancel inline keyboard for each new proposal.
+- `/help`, `/start`, `/today`, `/balance`, and numeric `^\\d{8,14}$` are
+  fast paths that bypass Claude.
 """
 from __future__ import annotations
 
@@ -10,7 +18,7 @@ import tempfile
 import time
 from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -44,13 +52,15 @@ def _make_cfg(db_path: Path, **overrides) -> Config:
     return Config(**base)
 
 
-def _msg(text: str | None = None, photo: list[dict] | None = None, chat_id: int = 42) -> dict:
-    """Build a Telegram message-update payload."""
+def _msg(text: str | None = None, photo: list[dict] | None = None,
+         caption: str | None = None, chat_id: int = 42) -> dict:
     body: dict = {"update_id": 1, "message": {"chat": {"id": chat_id}, "message_id": 99}}
     if text is not None:
         body["message"]["text"] = text
     if photo is not None:
         body["message"]["photo"] = photo
+    if caption is not None:
+        body["message"]["caption"] = caption
     return body
 
 
@@ -69,66 +79,34 @@ def _callback(data: str, chat_id: int = 42) -> dict:
 
 
 def test_dispatch_rejects_other_chat_ids(tmpdb):
+    """Non-whitelisted chat IDs must not reach any handler — and especially must not call Claude."""
     cfg = _make_cfg(tmpdb)
     with patch("src.telegram_bot.alerts.send_telegram") as mock_send, \
-         patch("src.telegram_bot.llm.extract_meal_from_text") as mock_llm:
+         patch("src.telegram_bot.llm.chat") as mock_chat:
         telegram_bot.dispatch(cfg, _msg(text="hello", chat_id=999), {})
     mock_send.assert_not_called()
-    mock_llm.assert_not_called()
-
-
-# ── command flow ──────────────────────────────────────────────────────────
-
-
-def test_dispatch_handles_help_command(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    with patch("src.telegram_bot.alerts.send_telegram") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="/help"), {})
-    mock_send.assert_called_once()
-    assert "garmin-monitor bot" in mock_send.call_args.args[1]
-
-
-def test_dispatch_routes_ask_to_chat(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    with patch("src.telegram_bot.llm.chat", return_value="Your protein is on track.") as mock_chat, \
-         patch("src.telegram_bot._send_plain") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="/ask How's my protein this week?"), {})
-    mock_chat.assert_called_once_with(cfg, "How's my protein this week?")
-    mock_send.assert_called_once()
-    assert "protein is on track" in mock_send.call_args.args[1]
-
-
-def test_dispatch_chat_alias_routes_to_chat(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    with patch("src.telegram_bot.llm.chat", return_value="ok") as mock_chat, \
-         patch("src.telegram_bot._send_plain"):
-        telegram_bot.dispatch(cfg, _msg(text="/chat sleep tonight?"), {})
-    mock_chat.assert_called_once_with(cfg, "sleep tonight?")
-
-
-def test_dispatch_ask_without_body_shows_usage(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    with patch("src.telegram_bot.llm.chat") as mock_chat, \
-         patch("src.telegram_bot._send_plain") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="/ask"), {})
     mock_chat.assert_not_called()
-    mock_send.assert_called_once()
-    assert "after the command" in mock_send.call_args.args[1].lower()
 
 
-def test_dispatch_ask_handles_chat_returning_none(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    with patch("src.telegram_bot.llm.chat", return_value=None), \
-         patch("src.telegram_bot._send_plain") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="/ask broken question"), {})
-    mock_send.assert_called_once()
-    assert "couldn't reach Claude" in mock_send.call_args.args[1]
+# ── fast-path commands ────────────────────────────────────────────────────
 
 
-def test_dispatch_today_command_pulls_balance(tmpdb):
+def test_help_command_sends_help_text(tmpdb):
     cfg = _make_cfg(tmpdb)
     with patch("src.telegram_bot.alerts.send_telegram") as mock_send, \
-         patch("src.telegram_bot.db.calorie_balance_for_date") as mock_bal:
+         patch("src.telegram_bot.llm.chat") as mock_chat:
+        telegram_bot.dispatch(cfg, _msg(text="/help"), {})
+    mock_send.assert_called_once()
+    text = mock_send.call_args.args[1]
+    assert "fitness & nutrition" in text
+    mock_chat.assert_not_called()
+
+
+def test_today_command_uses_fast_path_not_chat(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    with patch("src.telegram_bot.alerts.send_telegram") as mock_send, \
+         patch("src.telegram_bot.db.calorie_balance_for_date") as mock_bal, \
+         patch("src.telegram_bot.llm.chat") as mock_chat:
         mock_bal.return_value = {
             "date": "2026-05-05", "eaten_kcal": 800.0, "burned_kcal": 0,
             "bmr_kcal": 1700, "steps_burned_kcal": 250, "total_burned_kcal": 1950,
@@ -137,16 +115,16 @@ def test_dispatch_today_command_pulls_balance(tmpdb):
         }
         telegram_bot.dispatch(cfg, _msg(text="/today"), {})
     mock_bal.assert_called_once()
+    mock_chat.assert_not_called()
     text = mock_send.call_args.args[1]
     assert "Balance: -1150" in text
     assert "deficit" in text
 
 
-# ── text → barcode auto-insert ────────────────────────────────────────────
+# ── numeric barcode fast path ─────────────────────────────────────────────
 
 
-def test_dispatch_routes_numeric_to_barcode_lookup_and_proposes(tmpdb):
-    """Numeric barcode → OFF lookup → Confirm/Cancel keyboard. No DB write yet."""
+def test_numeric_barcode_proposes_via_off_without_calling_chat(tmpdb):
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
     info = {
@@ -157,21 +135,21 @@ def test_dispatch_routes_numeric_to_barcode_lookup_and_proposes(tmpdb):
         "serving_size_g": 330,
     }
     with patch("src.telegram_bot.food.lookup_barcode", return_value=info) as mock_lookup, \
-         patch("src.telegram_bot._send_with_keyboard") as mock_kb:
+         patch("src.telegram_bot._send_with_keyboard") as mock_kb, \
+         patch("src.telegram_bot.llm.chat") as mock_chat:
         telegram_bot.dispatch(cfg, _msg(text="5449000000996"), pending)
     mock_lookup.assert_called_once_with("5449000000996")
-    # Nothing inserted yet — proposal is in pending.
+    mock_chat.assert_not_called()
     assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
     assert len(pending) == 1
-    proposed = next(iter(pending.values()))["meal"]
-    assert proposed["barcode"] == "5449000000996"
-    # Keyboard contains both Confirm and Cancel.
+    pid = next(iter(pending))
+    assert pending[pid]["action"] == "insert"
+    assert pending[pid]["meal"]["barcode"] == "5449000000996"
     kb = mock_kb.call_args.args[2]
     assert any("confirm:" in b["callback_data"] for b in kb[0])
-    assert any("cancel:" in b["callback_data"] for b in kb[0])
 
 
-def test_dispatch_replies_when_barcode_not_in_off(tmpdb):
+def test_numeric_barcode_replies_when_not_in_off(tmpdb):
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
     with patch("src.telegram_bot.food.lookup_barcode", return_value=None), \
@@ -180,158 +158,116 @@ def test_dispatch_replies_when_barcode_not_in_off(tmpdb):
     mock_send.assert_called_once()
     assert "not found" in mock_send.call_args.args[1]
     assert pending == {}
-    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
 
 
-# ── text → claude extraction ──────────────────────────────────────────────
+# ── chat default for plain text ───────────────────────────────────────────
 
 
-def test_dispatch_routes_text_to_llm_and_proposes_confirmation(tmpdb):
-    """Free-text → Claude extraction → Confirm/Cancel keyboard. No DB write yet."""
+def test_plain_text_routes_to_chat(tmpdb):
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
-    extracted = {"description": "tuna sandwich", "kcal": 480, "protein_g": 28, "carbs_g": 50, "fat_g": 15}
-    with patch("src.telegram_bot.llm.extract_meal_from_text", return_value=extracted) as mock_llm, \
-         patch("src.telegram_bot._send_with_keyboard") as mock_kb:
-        telegram_bot.dispatch(cfg, _msg(text="tuna sandwich on whole wheat"), pending)
-    mock_llm.assert_called_once()
-    # Nothing in the DB yet; proposal lives in pending.
-    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
-    assert len(pending) == 1
-    proposed = next(iter(pending.values()))["meal"]
-    assert proposed["description"] == "tuna sandwich"
-    assert proposed["source"] == "text"
-    kb = mock_kb.call_args.args[2]
-    assert any("confirm:" in b["callback_data"] for b in kb[0])
-    assert any("cancel:" in b["callback_data"] for b in kb[0])
-
-
-def test_dispatch_replies_when_llm_returns_none(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    pending: dict[str, dict] = {}
-    with patch("src.telegram_bot.llm.extract_meal_from_text", return_value=None), \
+    with patch("src.telegram_bot.llm.chat", return_value="Logged: yogurt with granola — 320 kcal.") as mock_chat, \
          patch("src.telegram_bot._send_plain") as mock_send:
-        telegram_bot.dispatch(cfg, _msg(text="??"), pending)
-    mock_send.assert_called_once()
-    assert "couldn't" in mock_send.call_args.args[1].lower()
-    assert pending == {}
-    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
-
-
-def test_text_confirm_round_trip_inserts_meal(tmpdb):
-    """End-to-end: free-text → propose → tap ✅ → row appears."""
-    cfg = _make_cfg(tmpdb)
-    pending: dict[str, dict] = {}
-    extracted = {"description": "yogurt with granola", "kcal": 320, "protein_g": 12,
-                 "carbs_g": 45, "fat_g": 9, "source": "text"}
-    with patch("src.telegram_bot.llm.extract_meal_from_text", return_value=extracted), \
-         patch("src.telegram_bot._send_with_keyboard"):
         telegram_bot.dispatch(cfg, _msg(text="yogurt with granola"), pending)
-    pid = next(iter(pending))
-    with patch("src.telegram_bot._answer_callback"), \
-         patch("src.telegram_bot._edit_message_remove_keyboard"):
-        telegram_bot.dispatch(cfg, _callback(f"confirm:{pid}"), pending)
-    rows = db.meals_for_date(tmpdb, date.today().isoformat())
-    assert len(rows) == 1
-    assert rows[0]["description"] == "yogurt with granola"
-    assert rows[0]["source"] == "text"
-    assert pending == {}
+    # chat is called with cfg, the user text, and the same pending dict.
+    args, kwargs = mock_chat.call_args
+    assert args[0] is cfg
+    assert args[1] == "yogurt with granola"
+    assert args[2] is pending
+    assert kwargs.get("image_bytes") is None
+    mock_send.assert_called_once()
+    assert "Logged: yogurt" in mock_send.call_args.args[1]
 
 
-def test_barcode_cancel_round_trip_drops_proposal(tmpdb):
-    """Barcode → proposal → tap ❌ → DB stays empty."""
+def test_plain_text_surfaces_keyboard_for_each_new_pending_entry(tmpdb):
+    """When chat() parks a write proposal in `pending`, the bot must surface a Confirm/Cancel keyboard."""
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
-    info = {
-        "name": "Snack bar", "kcal_100g": 380, "protein_100g": 6, "carbs_100g": 55,
-        "fat_100g": 14, "fiber_100g": 2, "sugars_100g": 30, "saturated_fat_100g": 7,
-        "sodium_mg_100g": 120, "food_category": "Sugary snacks", "serving_size_g": 40,
-    }
-    with patch("src.telegram_bot.food.lookup_barcode", return_value=info), \
-         patch("src.telegram_bot._send_with_keyboard"):
-        telegram_bot.dispatch(cfg, _msg(text="1234567890123"), pending)
-    pid = next(iter(pending))
-    with patch("src.telegram_bot._answer_callback"), \
-         patch("src.telegram_bot._edit_message_remove_keyboard"):
-        telegram_bot.dispatch(cfg, _callback(f"cancel:{pid}"), pending)
-    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
-    assert pending == {}
+    proposal = {"action": "insert", "meal": {"description": "oats", "kcal": 350, "source": "ai"}, "ts": time.time()}
 
+    def fake_chat(cfg_, text, p, **kw):
+        p["abc123"] = proposal
+        return "Logged your oats."
 
-# ── photo flow ────────────────────────────────────────────────────────────
-
-
-def test_photo_flow_calls_vision_and_offers_confirmation(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    pending: dict[str, dict] = {}
-    extracted = {"kind": "meal", "meal": {"description": "plate of pasta", "kcal": 600}}
-    with patch("src.telegram_bot._download_telegram_file", return_value=(b"jpegbytes", "image/jpeg")), \
-         patch("src.telegram_bot.llm.extract_meal_from_photo", return_value=extracted) as mock_vision, \
+    with patch("src.telegram_bot.llm.chat", side_effect=fake_chat), \
+         patch("src.telegram_bot._send_plain") as mock_send, \
          patch("src.telegram_bot._send_with_keyboard") as mock_kb:
-        telegram_bot.dispatch(
-            cfg,
-            _msg(photo=[{"file_id": "fid", "file_size": 100}]),
-            pending,
-        )
-    mock_vision.assert_called_once()
-    # No insert yet — pending.
-    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
-    assert len(pending) == 1
-    pid = next(iter(pending))
-    assert pending[pid]["meal"]["description"] == "plate of pasta"
-    assert pending[pid]["meal"]["source"] == "photo"
-    # Keyboard contains both Confirm and Cancel.
+        telegram_bot.dispatch(cfg, _msg(text="oats 350 kcal"), pending)
+
+    mock_send.assert_called_once()  # the "Logged your oats." reply
+    mock_kb.assert_called_once()    # the Confirm/Cancel keyboard for the new pending entry
+    body = mock_kb.call_args.args[1]
+    assert "oats" in body
     kb = mock_kb.call_args.args[2]
-    assert any("confirm:" in b["callback_data"] for b in kb[0])
-    assert any("cancel:" in b["callback_data"] for b in kb[0])
+    assert any(b["callback_data"] == "confirm:abc123" for b in kb[0])
+    assert any(b["callback_data"] == "cancel:abc123" for b in kb[0])
 
 
-def test_photo_flow_routes_barcode_through_off(tmpdb):
+def test_plain_text_replies_with_failure_when_chat_returns_none(tmpdb):
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
-    info = {
-        "name": "Acme bar",
-        "kcal_100g": 400, "protein_100g": 5, "carbs_100g": 60, "fat_100g": 14,
-        "fiber_100g": 3, "sugars_100g": 35, "saturated_fat_100g": 8,
-        "sodium_mg_100g": 80, "food_category": "Sugary snacks",
-        "serving_size_g": 50,
-    }
+    with patch("src.telegram_bot.llm.chat", return_value=None), \
+         patch("src.telegram_bot._send_plain") as mock_send:
+        telegram_bot.dispatch(cfg, _msg(text="hello"), pending)
+    mock_send.assert_called_once()
+    assert "couldn't reach Claude" in mock_send.call_args.args[1]
+
+
+def test_plain_text_truncates_long_replies(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    long_reply = "x" * 5000
+    with patch("src.telegram_bot.llm.chat", return_value=long_reply), \
+         patch("src.telegram_bot._send_plain") as mock_send:
+        telegram_bot.dispatch(cfg, _msg(text="hello"), {})
+    sent = mock_send.call_args.args[1]
+    assert len(sent) <= 4100  # 4000 + the "[…truncated]" suffix
+    assert sent.endswith("[…truncated]")
+
+
+# ── photo flow → chat with image ──────────────────────────────────────────
+
+
+def test_photo_dispatched_to_chat_with_image_bytes(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
     with patch("src.telegram_bot._download_telegram_file", return_value=(b"jpegbytes", "image/jpeg")), \
-         patch("src.telegram_bot.llm.extract_meal_from_photo",
-               return_value={"kind": "barcode", "barcode": "1234567890123"}), \
-         patch("src.telegram_bot.food.lookup_barcode", return_value=info) as mock_lookup, \
-         patch("src.telegram_bot._send_with_keyboard") as mock_kb:
+         patch("src.telegram_bot.llm.chat", return_value="I see eggs and toast.") as mock_chat, \
+         patch("src.telegram_bot._send_plain"):
         telegram_bot.dispatch(
             cfg,
-            _msg(photo=[{"file_id": "fid", "file_size": 100}]),
+            _msg(photo=[{"file_id": "fid", "file_size": 100}], caption="lunch"),
             pending,
         )
-    mock_lookup.assert_called_once_with("1234567890123")
-    assert len(pending) == 1
-    proposed = list(pending.values())[0]["meal"]
-    # Scaled from 50g serving (factor 0.5).
-    assert proposed["kcal"] == 200
-    assert proposed["food_category"] == "Sugary snacks"
-    mock_kb.assert_called_once()
+    # Photo bytes propagated to chat as a kwarg; pending dict shared.
+    args, kwargs = mock_chat.call_args
+    assert args[0] is cfg
+    assert args[1] == "lunch"
+    assert args[2] is pending
+    assert kwargs["image_bytes"] == b"jpegbytes"
+    assert kwargs["mime_type"] == "image/jpeg"
 
 
-def test_photo_flow_replies_when_vision_returns_none(tmpdb):
+def test_photo_replies_when_download_fails(tmpdb):
     cfg = _make_cfg(tmpdb)
-    with patch("src.telegram_bot._download_telegram_file", return_value=(b"jpegbytes", "image/jpeg")), \
-         patch("src.telegram_bot.llm.extract_meal_from_photo", return_value=None), \
+    with patch("src.telegram_bot._download_telegram_file", return_value=(None, "")), \
+         patch("src.telegram_bot.llm.chat") as mock_chat, \
          patch("src.telegram_bot._send_plain") as mock_send:
         telegram_bot.dispatch(cfg, _msg(photo=[{"file_id": "fid", "file_size": 100}]), {})
+    mock_chat.assert_not_called()
     mock_send.assert_called_once()
-    assert "clearer angle" in mock_send.call_args.args[1]
+    assert "Couldn't download" in mock_send.call_args.args[1]
 
 
-# ── callback flow ─────────────────────────────────────────────────────────
+# ── callback flow: confirm + cancel for every action type ────────────────
 
 
-def test_callback_confirm_inserts_pending_meal(tmpdb):
+def test_callback_confirm_insert_writes_meal(tmpdb):
     cfg = _make_cfg(tmpdb)
-    pending = {"abc123": {"meal": {"description": "salmon plate", "kcal": 500, "source": "photo"},
-                          "ts": time.time()}}
+    pending = {"abc123": {
+        "action": "insert",
+        "meal": {"description": "salmon plate", "kcal": 500, "source": "ai"},
+        "ts": time.time(),
+    }}
     with patch("src.telegram_bot._answer_callback") as mock_ack, \
          patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit:
         telegram_bot.dispatch(cfg, _callback("confirm:abc123"), pending)
@@ -339,33 +275,67 @@ def test_callback_confirm_inserts_pending_meal(tmpdb):
     rows = db.meals_for_date(tmpdb, date.today().isoformat())
     assert len(rows) == 1
     assert rows[0]["description"] == "salmon plate"
-    mock_ack.assert_called_once()
-    mock_edit.assert_called_once()
+    assert mock_ack.call_args.args[2] == "Logged"
     assert "Logged" in mock_edit.call_args.args[3]
 
 
-def test_callback_cancel_drops_pending_without_insert(tmpdb):
+def test_callback_confirm_edit_applies_partial_update(tmpdb):
     cfg = _make_cfg(tmpdb)
-    pending = {"abc123": {"meal": {"description": "salmon plate", "kcal": 500},
-                          "ts": time.time()}}
+    mid = db.insert_meal(tmpdb, {"description": "porridge", "source": "manual", "kcal": 350})
+    pending = {"e1": {
+        "action": "edit",
+        "meal_id": mid,
+        "fields": {"kcal": 320, "description": "porridge (corrected)"},
+        "before": db.get_meal_by_id(tmpdb, mid),
+        "ts": time.time(),
+    }}
+    with patch("src.telegram_bot._answer_callback") as mock_ack, \
+         patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit:
+        telegram_bot.dispatch(cfg, _callback("confirm:e1"), pending)
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["kcal"] == 320
+    assert after["description"] == "porridge (corrected)"
+    assert mock_ack.call_args.args[2] == "Updated"
+    assert "Updated meal" in mock_edit.call_args.args[3]
+
+
+def test_callback_confirm_delete_removes_row(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    mid = db.insert_meal(tmpdb, {"description": "snack", "source": "manual", "kcal": 200})
+    pending = {"d1": {
+        "action": "delete",
+        "meal_id": mid,
+        "before": db.get_meal_by_id(tmpdb, mid),
+        "ts": time.time(),
+    }}
+    with patch("src.telegram_bot._answer_callback") as mock_ack, \
+         patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit:
+        telegram_bot.dispatch(cfg, _callback("confirm:d1"), pending)
+    assert db.get_meal_by_id(tmpdb, mid) is None
+    assert mock_ack.call_args.args[2] == "Deleted"
+    assert "Deleted meal" in mock_edit.call_args.args[3]
+
+
+def test_callback_cancel_drops_pending_without_writing(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    pending = {"abc123": {"action": "insert", "meal": {"description": "x", "kcal": 100}, "ts": time.time()}}
     with patch("src.telegram_bot._answer_callback"), \
          patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit:
         telegram_bot.dispatch(cfg, _callback("cancel:abc123"), pending)
-    assert "abc123" not in pending
+    assert pending == {}
     assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
     assert "Cancelled" in mock_edit.call_args.args[3]
 
 
 def test_callback_unknown_action_does_not_drop_pending_entry(tmpdb):
-    """Bad/unknown callback data must not silently consume a still-valid pending proposal."""
+    """Bad callback data must not consume a still-valid pending proposal."""
     cfg = _make_cfg(tmpdb)
-    pending = {"abc123": {"meal": {"description": "hummus", "kcal": 250},
+    pending = {"abc123": {"action": "insert", "meal": {"description": "hummus", "kcal": 250},
                           "ts": time.time()}}
     with patch("src.telegram_bot._answer_callback") as mock_ack, \
          patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit, \
          patch("src.telegram_bot.db.insert_meal") as mock_insert:
         telegram_bot.dispatch(cfg, _callback("foo:abc123"), pending)
-    # Action was unknown — entry must still be pending so the user can retry.
     assert pending["abc123"]["meal"]["description"] == "hummus"
     mock_insert.assert_not_called()
     mock_edit.assert_not_called()
@@ -376,32 +346,65 @@ def test_callback_expired_pending_replies_gracefully(tmpdb):
     cfg = _make_cfg(tmpdb)
     with patch("src.telegram_bot._answer_callback") as mock_ack, \
          patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit:
-        telegram_bot.dispatch(cfg, _callback("confirm:gone"), {})  # empty pending
+        telegram_bot.dispatch(cfg, _callback("confirm:gone"), {})
     assert mock_ack.call_args.args[2] == "Expired"
     assert "expired" in mock_edit.call_args.args[3].lower()
-    assert db.meals_for_date(tmpdb, date.today().isoformat()) == []
 
 
-# ── confirm we never persist photo bytes ──────────────────────────────────
+# ── end-to-end chains ─────────────────────────────────────────────────────
+
+
+def test_text_to_chat_to_confirm_round_trip_inserts_meal(tmpdb):
+    """Plain text → chat parks a log_meal proposal → tap ✅ → meal lands in DB."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+
+    def fake_chat(cfg_, text, p, **kw):
+        p["abc123"] = {
+            "action": "insert",
+            "meal": {"description": "tuna sandwich", "kcal": 480, "source": "ai"},
+            "ts": time.time(),
+        }
+        return "Logged: tuna sandwich — 480 kcal."
+
+    with patch("src.telegram_bot.llm.chat", side_effect=fake_chat), \
+         patch("src.telegram_bot._send_plain"), \
+         patch("src.telegram_bot._send_with_keyboard"):
+        telegram_bot.dispatch(cfg, _msg(text="tuna sandwich on whole wheat"), pending)
+    with patch("src.telegram_bot._answer_callback"), \
+         patch("src.telegram_bot._edit_message_remove_keyboard"):
+        telegram_bot.dispatch(cfg, _callback("confirm:abc123"), pending)
+    rows = db.meals_for_date(tmpdb, date.today().isoformat())
+    assert len(rows) == 1
+    assert rows[0]["description"] == "tuna sandwich"
 
 
 def test_photo_flow_does_not_leak_image_bytes_to_db(tmpdb):
-    """Sanity: after a photo round-trip + confirm, the meals row has no base64 data."""
+    """Round-trip a photo through chat + confirm — assert no raw bytes anywhere on disk."""
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
-    extracted = {"kind": "meal", "meal": {"description": "noodles", "kcal": 400}}
+
+    def fake_chat(cfg_, text, p, **kw):
+        # The bot must pass image_bytes through; simulate a log_meal proposal.
+        assert kw.get("image_bytes") == b"\x00" * 50000
+        p["pid1"] = {
+            "action": "insert",
+            "meal": {"description": "noodles", "kcal": 400, "source": "ai"},
+            "ts": time.time(),
+        }
+        return "Logged: noodles."
+
     with patch("src.telegram_bot._download_telegram_file", return_value=(b"\x00" * 50000, "image/jpeg")), \
-         patch("src.telegram_bot.llm.extract_meal_from_photo", return_value=extracted), \
+         patch("src.telegram_bot.llm.chat", side_effect=fake_chat), \
+         patch("src.telegram_bot._send_plain"), \
          patch("src.telegram_bot._send_with_keyboard"):
         telegram_bot.dispatch(cfg, _msg(photo=[{"file_id": "fid", "file_size": 100}]), pending)
-    pid = next(iter(pending))
     with patch("src.telegram_bot._answer_callback"), \
          patch("src.telegram_bot._edit_message_remove_keyboard"):
-        telegram_bot.dispatch(cfg, _callback(f"confirm:{pid}"), pending)
+        telegram_bot.dispatch(cfg, _callback("confirm:pid1"), pending)
     rows = db.meals_for_date(tmpdb, date.today().isoformat())
     assert len(rows) == 1
-    assert rows[0]["raw_json"] in (None, "")  # never populated by the bot
-    # No table named photo_*: every row in sqlite_master should be a known table.
+    assert rows[0]["raw_json"] in (None, "")  # bot never populates raw_json
     import sqlite3
     with sqlite3.connect(tmpdb) as conn:
         names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]

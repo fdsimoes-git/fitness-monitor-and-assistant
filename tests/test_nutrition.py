@@ -163,6 +163,62 @@ def test_recent_calorie_balance_returns_one_row_per_day(tmpdb):
     assert out[-1]["balance_kcal"] < 0
 
 
+def test_get_meal_by_id_round_trip(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "salmon", "source": "manual", "kcal": 400})
+    got = db.get_meal_by_id(tmpdb, mid)
+    assert got is not None
+    assert got["id"] == mid
+    assert got["description"] == "salmon"
+    assert got["kcal"] == 400
+
+
+def test_get_meal_by_id_returns_none_for_missing():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "t.db"
+        db.init_db(p)
+        assert db.get_meal_by_id(p, 99999) is None
+
+
+def test_update_meal_applies_partial_fields(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "salmon", "source": "manual", "kcal": 400, "protein_g": 30})
+    assert db.update_meal(tmpdb, mid, {"kcal": 380, "protein_g": 32}) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["kcal"] == 380
+    assert after["protein_g"] == 32
+    assert after["description"] == "salmon"  # untouched
+
+
+def test_update_meal_drops_unknown_columns(tmpdb):
+    """Unknown keys must be silently ignored — the tool layer is the validator."""
+    mid = db.insert_meal(tmpdb, {"description": "salmon", "source": "manual", "kcal": 400})
+    # `id` and `source` aren't in _EDITABLE_MEAL_COLUMNS — should not change.
+    db.update_meal(tmpdb, mid, {"id": 9999, "source": "evil", "kcal": 350})
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["id"] == mid
+    assert after["source"] == "manual"
+    assert after["kcal"] == 350
+
+
+def test_update_meal_returns_false_when_no_valid_fields(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    assert db.update_meal(tmpdb, mid, {"id": 1, "source": "y"}) is False
+
+
+def test_update_meal_returns_false_for_missing_row(tmpdb):
+    assert db.update_meal(tmpdb, 99999, {"kcal": 100}) is False
+
+
+def test_delete_meal_removes_row(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    assert db.delete_meal(tmpdb, mid) is True
+    assert db.get_meal_by_id(tmpdb, mid) is None
+
+
+def test_delete_meal_returns_false_for_missing(tmpdb):
+    assert db.delete_meal(tmpdb, 99999) is False
+
+
 def test_meals_persist_new_columns(tmpdb):
     """Schema additions round-trip through insert_meal + meals_for_date."""
     today = date.today().isoformat()

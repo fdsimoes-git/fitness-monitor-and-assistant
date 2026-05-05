@@ -356,3 +356,169 @@ def test_execute_chat_tool_unknown_returns_error(tmpdb_cfg):
     out = llm._execute_chat_tool("get_does_not_exist", {}, tmpdb_cfg)
     assert "error" in out
     assert "Unknown tool" in out["error"]
+
+
+# ── write tools (validate-and-stash) ────────────────────────────────────────
+
+
+def test_log_meal_tool_parks_in_pending_without_writing(tmpdb_cfg):
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool(
+        "log_meal",
+        {"description": "oats", "kcal": 350, "protein_g": 12},
+        tmpdb_cfg, pending,
+    )
+    assert out["needs_confirmation"] is True
+    assert out["action"] == "insert"
+    assert "oats" in out["summary"]
+    pid = out["pending_id"]
+    assert pending[pid]["action"] == "insert"
+    assert pending[pid]["meal"]["description"] == "oats"
+    # Nothing in the DB yet.
+    from src import db as _db
+    from datetime import date
+    assert _db.meals_for_date(tmpdb_cfg.db_path, date.today().isoformat()) == []
+
+
+def test_log_meal_tool_rejects_missing_required_fields(tmpdb_cfg):
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool("log_meal", {"description": "oats"}, tmpdb_cfg, pending)
+    assert "error" in out
+    assert pending == {}
+
+
+def test_edit_meal_tool_parks_edit_with_before_snapshot(tmpdb_cfg):
+    from src import db as _db
+    mid = _db.insert_meal(tmpdb_cfg.db_path, {"description": "salmon", "source": "manual", "kcal": 400})
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool(
+        "edit_meal",
+        {"meal_id": mid, "kcal": 380, "description": "salmon (corrected)"},
+        tmpdb_cfg, pending,
+    )
+    assert out["needs_confirmation"] is True
+    pid = out["pending_id"]
+    assert pending[pid]["action"] == "edit"
+    assert pending[pid]["meal_id"] == mid
+    assert pending[pid]["fields"] == {"kcal": 380, "description": "salmon (corrected)"}
+    assert pending[pid]["before"]["description"] == "salmon"
+
+
+def test_edit_meal_tool_returns_error_for_missing_meal(tmpdb_cfg):
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool("edit_meal", {"meal_id": 99999, "kcal": 100}, tmpdb_cfg, pending)
+    assert "error" in out
+    assert pending == {}
+
+
+def test_edit_meal_tool_requires_at_least_one_field(tmpdb_cfg):
+    from src import db as _db
+    mid = _db.insert_meal(tmpdb_cfg.db_path, {"description": "x", "source": "manual", "kcal": 100})
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool("edit_meal", {"meal_id": mid}, tmpdb_cfg, pending)
+    assert "error" in out
+    assert pending == {}
+
+
+def test_delete_meal_tool_parks_delete_with_before_snapshot(tmpdb_cfg):
+    from src import db as _db
+    mid = _db.insert_meal(tmpdb_cfg.db_path, {"description": "snack", "source": "manual", "kcal": 200})
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool("delete_meal", {"meal_id": mid}, tmpdb_cfg, pending)
+    assert out["needs_confirmation"] is True
+    pid = out["pending_id"]
+    assert pending[pid]["action"] == "delete"
+    assert pending[pid]["meal_id"] == mid
+    assert pending[pid]["before"]["description"] == "snack"
+    # Row still present until confirm runs.
+    assert _db.get_meal_by_id(tmpdb_cfg.db_path, mid) is not None
+
+
+def test_delete_meal_tool_returns_error_for_missing_meal(tmpdb_cfg):
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool("delete_meal", {"meal_id": 88888}, tmpdb_cfg, pending)
+    assert "error" in out
+    assert pending == {}
+
+
+def test_lookup_barcode_tool_returns_meal_dict_on_hit(tmpdb_cfg):
+    info = {
+        "name": "Acme Bar", "kcal_100g": 400, "protein_100g": 5, "carbs_100g": 60,
+        "fat_100g": 14, "fiber_100g": 3, "sugars_100g": 35, "saturated_fat_100g": 8,
+        "sodium_mg_100g": 80, "food_category": "Sugary snacks", "serving_size_g": 50,
+    }
+    with patch("src.llm.food.lookup_barcode", return_value=info):
+        out = llm._execute_chat_tool("lookup_barcode", {"barcode": "1234567890123"},
+                                      tmpdb_cfg, {})
+    # meal_from_barcode_info default scales to serving_size_g (50g, factor 0.5).
+    assert out["kcal"] == 200
+    assert out["food_category"] == "Sugary snacks"
+    assert out["barcode"] == "1234567890123"
+
+
+def test_lookup_barcode_tool_returns_error_on_miss(tmpdb_cfg):
+    with patch("src.llm.food.lookup_barcode", return_value=None):
+        out = llm._execute_chat_tool("lookup_barcode", {"barcode": "9999999999"},
+                                      tmpdb_cfg, {})
+    assert "error" in out
+
+
+# ── chat() with image input ─────────────────────────────────────────────────
+
+
+def test_chat_passes_image_block_when_image_bytes_provided():
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("That's a meal.")],
+        stop_reason="end_turn",
+    )
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        out = llm.chat(cfg, "what is this?", {}, image_bytes=b"\x89PNG", mime_type="image/png")
+    assert out == "That's a meal."
+    user_content = fake_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    image_blocks = [c for c in user_content if c.get("type") == "image"]
+    assert len(image_blocks) == 1
+    assert image_blocks[0]["source"]["media_type"] == "image/png"
+    text_blocks = [c for c in user_content if c.get("type") == "text"]
+    assert text_blocks[0]["text"] == "what is this?"
+
+
+def test_chat_provides_default_caption_when_image_only():
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("ok")], stop_reason="end_turn",
+    )
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        llm.chat(cfg, "", {}, image_bytes=b"\x89PNG", mime_type="image/png")
+    user_content = fake_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    text_blocks = [c for c in user_content if c.get("type") == "text"]
+    # Empty caption falls back to a default prompt that mentions "log it".
+    assert "log" in text_blocks[0]["text"].lower()
+
+
+def test_chat_full_log_meal_loop_parks_pending(tmpdb_cfg):
+    """End-to-end through the agentic loop: model calls log_meal, tool stashes pending, model summarises."""
+    from src import db as _db
+    pending: dict[str, dict] = {}
+    tool_use_resp = SimpleNamespace(
+        content=[_tool_use_block("tu_1", "log_meal", {"description": "oats", "kcal": 350})],
+        stop_reason="tool_use",
+    )
+    final_resp = SimpleNamespace(
+        content=[_text_block("Logged: oats — 350 kcal.")],
+        stop_reason="end_turn",
+    )
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [tool_use_resp, final_resp]
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        out = llm.chat(tmpdb_cfg, "log oats 350 kcal", pending)
+    assert out == "Logged: oats — 350 kcal."
+    # Tool ran via dispatcher → pending populated → DB still empty.
+    assert len(pending) == 1
+    pid = next(iter(pending))
+    assert pending[pid]["action"] == "insert"
+    assert pending[pid]["meal"]["description"] == "oats"
+    from datetime import date
+    assert _db.meals_for_date(tmpdb_cfg.db_path, date.today().isoformat()) == []

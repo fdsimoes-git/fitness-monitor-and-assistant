@@ -89,17 +89,43 @@ Retention: `daily_summary` and `alerts` are kept forever (one row per day, tiny)
 
 All frontend assets (Tailwind, Chart.js, htmx) come from CDN — no build step.
 
-### Telegram meal-logging bot
+### Telegram fitness/nutrition assistant
 
-`src/telegram_bot.py` runs a long-poll loop against Telegram's Bot API and dispatches inbound messages on a single chat (whitelisted via `TELEGRAM_CHAT_ID`):
+`src/telegram_bot.py` is a **chat-first agent**, modelled directly on asset-management's financial advisor. Plain text and photos default to `llm.chat()` with a 12-tool surface; the model orchestrates everything. A handful of fast-path commands bypass Claude for deterministic shortcuts:
 
-- **All meal-logging paths surface a Confirm/Cancel inline keyboard before any `db.insert_meal` runs.** Text, numeric-barcode, photo (visual), and photo (barcode-extracted) all go through the same `_offer_confirmation` helper. Nothing is persisted until the user taps ✅.
-- **Text** → `llm.extract_meal_from_text` (Claude with `record_meal` tool forced) → `_offer_confirmation` → keyboard.
-- **Numeric `^\d{8,14}$`** → `food.lookup_barcode` → `food.meal_from_barcode_info` → `_offer_confirmation` → keyboard.
-- **Photo** → `getFile` → `llm.extract_meal_from_photo` (Claude vision with two tools: `record_meal` + `extract_barcode`). If a barcode is in frame, route through OFF; otherwise use the visual estimate. Either way, `_offer_confirmation` surfaces the keyboard.
-- **`callback_query`** → confirm/cancel against an in-process `pending` dict (keyed by short UUID, swept after 1h). Confirm → `db.insert_meal`; Cancel → drop.
-- **`/help`, `/today`, `/balance`** → static help / today's calorie balance.
-- **`/ask <question>` (alias `/chat`)** → `llm.chat`, an agentic tool-use loop with eight read-only DB tools (`get_balance`, `get_meals`, `get_recent_meals`, `get_daily_summary`, `get_trends`, `get_activities`, `get_readiness`, `get_training_intel`). Claude can chain calls; the loop is capped at `CHAT_MAX_ITERATIONS=6`. The system prompt includes today's date so Claude can resolve relative time ("yesterday", "this week") to ISO dates before calling tools.
+- **`/help`, `/start`** → static help text.
+- **`/today`, `/balance`** → `db.calorie_balance_for_date` formatted reply (no Claude call).
+- **Numeric `^\d{8,14}$`** → `food.lookup_barcode` → `food.meal_from_barcode_info` → propose insert (no Claude call).
+- **Anything else (text, photo, photo+caption)** → `llm.chat(cfg, text, pending, image_bytes=…)`.
+
+The 12 tools registered in `llm.CHAT_TOOLS`:
+
+| Read | Write |
+|---|---|
+| `get_balance` | `log_meal` (proposes insert) |
+| `get_meals` | `edit_meal` (proposes partial update) |
+| `get_recent_meals` | `delete_meal` (proposes delete) |
+| `get_daily_summary` | `lookup_barcode` (read-only OFF lookup) |
+| `get_trends` | |
+| `get_activities` | |
+| `get_readiness` | |
+| `get_training_intel` | |
+
+#### Validate-and-stash two-phase write pattern
+
+Mirrors `asset-management/server.js:4803-4823`. When Claude calls a write tool, the dispatcher in `llm._execute_chat_tool` does NOT touch the DB. It validates, builds a proposal entry — `{action: 'insert'|'edit'|'delete', meal | meal_id | fields | before, ts}` — and parks it in the per-process `pending` dict via `_stash_pending`. The tool result returned to Claude is `{pending_id, needs_confirmation: True, action, summary}`.
+
+The bot's `_run_chat` snapshots `pending.keys()` before the call and diffs after. For each new pending entry it calls `_surface_pending`, which renders an action-aware Confirm/Cancel inline keyboard (✅ Log it / ✏️ Apply edit / 🗑 Delete). The `callback_data` shape (`confirm:UUID` / `cancel:UUID`) is uniform — `_handle_callback` doesn't need to know about action types; it pops the entry and dispatches to `_apply_pending`, which branches on `entry["action"]`:
+
+- `insert` → `db.insert_meal`
+- `edit` → `db.update_meal` (only `_EDITABLE_MEAL_COLUMNS` are accepted)
+- `delete` → `db.delete_meal`
+
+Pending entries TTL-out after 1h via `_sweep_pending`. If the bot restarts mid-confirmation the entry is lost; the user just re-asks (which now hits the chat path again).
+
+#### Vision
+
+`llm.chat()` accepts optional `image_bytes` + `mime_type` and inserts them as a base64 image content block in the user message. The model sees the image alongside any caption text and can call any tool. Asset-management has no vision in chat — this is a Telegram-specific extension. **Image bytes are never persisted** — the buffer is dropped right after the SDK call returns; `tests/test_telegram_bot.py::test_photo_flow_does_not_leak_image_bytes_to_db` enforces this.
 
 `src/llm.py` mirrors the credential-resolution pattern from `asset-management/server.js` (lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set we use the OAuth route (Bearer token + `anthropic-beta: oauth-2025-04-20` header + a system prefix identifying the request as Claude Code) so calls bill to the user's Claude Code subscription; otherwise we use the standard `ANTHROPIC_API_KEY` route. Default model `claude-sonnet-4-6`; override via `CLAUDE_MODEL`.
 

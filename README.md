@@ -24,14 +24,22 @@ cp .env.example .env
 3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy your `chat.id`
 4. Drop both into `.env`
 
-## Telegram bot (optional)
+## Telegram fitness/nutrition assistant (optional)
 
-The same Telegram bot used for alerts also accepts inbound meal logs and free-form questions about your data, both powered by Claude. You can:
-- Send a free-text meal description (`"oat porridge with banana ~350 kcal"`)
-- Send a photo of your plate or a packaged product (Confirm/Cancel before logging)
-- Send a numeric barcode (8–14 digits)
-- `/ask How's my protein this week?` (alias `/chat`) — Claude reads from your local DB and answers
-- Run `/help`, `/today`, or `/balance`
+The Telegram bot is now a chat-first health assistant — modelled after the financial advisor in `asset-management/server.js`. Just chat with it; the assistant decides whether to query your data or propose a write to your meal log. Every meal insert / edit / delete shows a Confirm/Cancel button before anything touches the DB.
+
+Things you can say:
+- `oat porridge with banana, ~350 kcal` — proposes a log
+- send a photo of your food or a packaged product — visual estimate or barcode lookup
+- `5449000000996` — bare barcode → Open Food Facts lookup → propose log
+- `delete the snack from yesterday`
+- `change meal 12 to 250 kcal`
+- `how's my protein this week?`
+- `should I train hard today?`
+- `what did I eat yesterday?`
+
+Fast-path commands (no Claude call):
+- `/help`, `/today`, `/balance`
 
 ```bash
 .venv/bin/pip install -r requirements-bot.txt   # adds the anthropic SDK

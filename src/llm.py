@@ -36,10 +36,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
+import uuid
 from datetime import date, timedelta
 from typing import Any, NamedTuple
 
-from . import db
+from . import db, food
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -321,13 +323,14 @@ def extract_meal_from_photo(
 # Chat with read-only DB tools (data-aware /ask flow)
 # ──────────────────────────────────────────────────────────────────────────────
 
-CHAT_MAX_ITERATIONS = 6  # cap on tool-use loops per /ask invocation
+CHAT_MAX_ITERATIONS = 6  # cap on tool-use loops per chat() invocation
 
 
-# Tools the model can call to inspect the user's local DB. All are read-only;
-# the chat path never inserts, updates, or deletes. Schemas are intentionally
-# small — Claude does the heavy lifting of mapping natural-language questions
-# to the right tool + args.
+# Tools the model can call. Eight are read-only, four are "validate-and-stash"
+# write tools that mirror asset-management's two-phase pattern: the tool
+# parks a proposal in the per-process `pending` dict and returns
+# {pending_id, needs_confirmation, summary} — actual DB writes happen only
+# when the user taps ✅ in Telegram (handled by telegram_bot._handle_callback).
 CHAT_TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_balance",
@@ -427,15 +430,120 @@ CHAT_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    # ── Write tools (validate-and-stash; user confirms in Telegram) ──
+    {
+        "name": "log_meal",
+        "description": (
+            "PROPOSE inserting a meal into the user's log. Does NOT write immediately — the bot "
+            "will surface a Confirm/Cancel inline keyboard; only on ✅ does the row land in SQLite. "
+            "Use after estimating macros from a description, scaling barcode data, or extracting "
+            "from an image. Required: description and kcal."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["description", "kcal"],
+            "properties": {
+                "description": {"type": "string"},
+                "kcal": {"type": "number"},
+                "protein_g": {"type": "number"},
+                "carbs_g": {"type": "number"},
+                "fat_g": {"type": "number"},
+                "fiber_g": {"type": "number"},
+                "sugars_g": {"type": "number"},
+                "saturated_fat_g": {"type": "number"},
+                "sodium_mg": {"type": "number"},
+                "food_category": {
+                    "type": "string",
+                    "description": "OFF pnns_groups_2 style: 'Vegetables', 'Sugary snacks', 'Cereals', etc.",
+                },
+                "meal_time": {"type": "string", "description": "ISO timestamp; defaults to now."},
+            },
+        },
+    },
+    {
+        "name": "edit_meal",
+        "description": (
+            "PROPOSE editing an existing meal by id. Pass meal_id (from get_meals / get_recent_meals) "
+            "and only the fields you want to change. The bot surfaces Confirm/Cancel before the "
+            "update runs."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["meal_id"],
+            "properties": {
+                "meal_id": {"type": "integer"},
+                "description": {"type": "string"},
+                "kcal": {"type": "number"},
+                "protein_g": {"type": "number"},
+                "carbs_g": {"type": "number"},
+                "fat_g": {"type": "number"},
+                "fiber_g": {"type": "number"},
+                "sugars_g": {"type": "number"},
+                "saturated_fat_g": {"type": "number"},
+                "sodium_mg": {"type": "number"},
+                "food_category": {"type": "string"},
+                "meal_time": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "delete_meal",
+        "description": (
+            "PROPOSE deleting a meal by id. The bot surfaces Confirm/Cancel before the delete runs."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["meal_id"],
+            "properties": {"meal_id": {"type": "integer"}},
+        },
+    },
+    {
+        "name": "lookup_barcode",
+        "description": (
+            "Look up nutrition for a packaged product by EAN/UPC barcode in Open Food Facts. "
+            "Returns the nutrition payload as a meal-shaped dict (kcal, macros, fiber, etc.) "
+            "scaled to the requested grams (or the API's serving size, or 100g). "
+            "Use the result's fields to construct a log_meal call, OR call log_meal directly "
+            "after this — the response is meant to be consumed, not displayed verbatim."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["barcode"],
+            "properties": {
+                "barcode": {"type": "string", "pattern": r"^\d{8,14}$"},
+                "grams": {
+                    "type": "number",
+                    "description": "Serving size to scale to. Optional; defaults to OFF's serving_size_g or 100g.",
+                },
+            },
+        },
+    },
 ]
 
 
-def _execute_chat_tool(name: str, input_data: dict, cfg: Config) -> Any:
-    """Dispatcher mapping tool name → existing db.py helper. Returns a JSON-
-    serializable result, or `{"error": "..."}` on a recognised failure."""
+def _execute_chat_tool(
+    name: str,
+    input_data: dict,
+    cfg: Config,
+    pending: dict[str, dict[str, Any]] | None = None,
+) -> Any:
+    """Dispatcher mapping tool name → existing db.py helper or write proposal.
+
+    Read-only tools return JSON-serializable data straight from the DB.
+    Write tools (log_meal, edit_meal, delete_meal) park a proposal in
+    `pending` and return {pending_id, needs_confirmation, summary} so Claude
+    can describe what's about to happen — the actual DB write only fires
+    when the user taps ✅ in Telegram.
+
+    Returns `{"error": "..."}` on recognised failures so the model can
+    adapt instead of crashing the loop.
+    """
+    if pending is None:
+        pending = {}
     today = date.today().isoformat()
     target = (input_data.get("date") or today)
 
+    # ── Read tools ────────────────────────────────────────────────────────
     if name == "get_balance":
         return db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg)
     if name == "get_meals":
@@ -465,41 +573,160 @@ def _execute_chat_tool(name: str, input_data: dict, cfg: Config) -> Any:
             "z2": db.z2_minutes_for_week(cfg.db_path, target, cfg),
             "sleep_debt": db.sleep_debt(cfg.db_path, target, cfg),
         }
+    if name == "lookup_barcode":
+        info = food.lookup_barcode(str(input_data.get("barcode") or "").strip())
+        if info is None:
+            return {"error": "Barcode not found in Open Food Facts."}
+        grams = input_data.get("grams")
+        return food.meal_from_barcode_info(info, str(input_data["barcode"]), grams=grams)
+
+    # ── Write tools (validate-and-stash) ──────────────────────────────────
+    if name == "log_meal":
+        meal = {k: v for k, v in input_data.items()}
+        if "description" not in meal or "kcal" not in meal:
+            return {"error": "log_meal requires description and kcal"}
+        meal.setdefault("source", "ai")
+        return _stash_pending(pending, action="insert", meal=meal)
+
+    if name == "edit_meal":
+        try:
+            meal_id = int(input_data.get("meal_id"))
+        except (TypeError, ValueError):
+            return {"error": "edit_meal requires an integer meal_id"}
+        before = db.get_meal_by_id(cfg.db_path, meal_id)
+        if before is None:
+            return {"error": f"Meal #{meal_id} not found."}
+        fields = {k: v for k, v in input_data.items() if k != "meal_id"}
+        if not fields:
+            return {"error": "edit_meal requires at least one field to change"}
+        return _stash_pending(
+            pending, action="edit", meal_id=meal_id, fields=fields, before=before,
+        )
+
+    if name == "delete_meal":
+        try:
+            meal_id = int(input_data.get("meal_id"))
+        except (TypeError, ValueError):
+            return {"error": "delete_meal requires an integer meal_id"}
+        before = db.get_meal_by_id(cfg.db_path, meal_id)
+        if before is None:
+            return {"error": f"Meal #{meal_id} not found."}
+        return _stash_pending(pending, action="delete", meal_id=meal_id, before=before)
+
     return {"error": f"Unknown tool: {name}"}
 
 
+def _stash_pending(
+    pending: dict[str, dict[str, Any]], *, action: str, **payload: Any,
+) -> dict[str, Any]:
+    """Park a proposal in `pending` and return the contract Claude expects:
+    a pending_id, a flag the model can describe, and a short summary."""
+    pid = uuid.uuid4().hex[:10]
+    entry = {"action": action, "ts": time.time(), **payload}
+    pending[pid] = entry
+    return {
+        "pending_id": pid,
+        "needs_confirmation": True,
+        "action": action,
+        "summary": _summarize_pending(entry),
+    }
+
+
+def _summarize_pending(entry: dict) -> str:
+    action = entry.get("action")
+    if action == "insert":
+        meal = entry.get("meal") or {}
+        kcal = meal.get("kcal")
+        return f"Log: {meal.get('description', '?')} — {int(kcal) if kcal is not None else '—'} kcal"
+    if action == "edit":
+        fields = entry.get("fields") or {}
+        keys = ", ".join(fields.keys()) or "(no fields)"
+        return f"Edit meal #{entry.get('meal_id')}: change {keys}"
+    if action == "delete":
+        before = entry.get("before") or {}
+        return f"Delete meal #{entry.get('meal_id')}: {before.get('description', '?')}"
+    return f"Pending {action}"
+
+
 _CHAT_SYSTEM_TEMPLATE = (
-    "You are the user's personal health assistant for the garmin-monitor app. "
-    "You can query their local SQLite database via the provided tools. "
+    "You are the user's personal fitness and nutrition assistant for the "
+    "garmin-monitor app. You have direct access to their local SQLite DB via "
+    "the provided tools — both read tools (balance, meals, trends, readiness, "
+    "training intel) and write tools (log_meal, edit_meal, delete_meal). You "
+    "are also given a lookup_barcode tool that hits Open Food Facts.\n\n"
     "Today is {today}.\n\n"
     "Rules:\n"
-    "• Cite specific numbers from the tool results — never invent values.\n"
-    "• If the data isn't there, say so plainly (\"no meals logged yesterday\").\n"
-    "• Replies are rendered in a Telegram chat: keep them concise (2–4 sentences "
+    "• Cite specific numbers from tool results — never invent values.\n"
+    "• When the user describes a meal (text or photo) call log_meal to "
+    "propose it. Do NOT explain that you need a confirmation: the bot will "
+    "show a Confirm/Cancel keyboard automatically when log_meal returns. "
+    "Just describe what you proposed in past tense (\"Logged: …\").\n"
+    "• If a packaged-product barcode is visible in a photo or message, call "
+    "lookup_barcode first, then log_meal with the result's fields.\n"
+    "• To edit or remove a meal, first call get_meals or get_recent_meals to "
+    "find the meal_id, then call edit_meal or delete_meal.\n"
+    "• Resolve relative time (\"yesterday\", \"this week\") to ISO dates "
+    "client-side before calling tools.\n"
+    "• Replies render in a Telegram chat. Keep them concise (1–3 sentences "
     "unless the user asks for detail). Plain text — no Markdown.\n"
-    "• When the user asks about \"yesterday\", \"this week\", etc., resolve to ISO dates "
-    "yourself before calling tools.\n"
-    "• You may call multiple tools in sequence to answer one question."
+    "• You may chain multiple tool calls in one turn."
 )
 
 
-def chat(cfg: Config, user_text: str) -> str | None:
+def chat(
+    cfg: Config,
+    user_text: str,
+    pending: dict[str, dict[str, Any]] | None = None,
+    *,
+    image_bytes: bytes | None = None,
+    mime_type: str | None = None,
+) -> str | None:
     """Run an agentic conversation turn against `CHAT_TOOLS` and return the
-    final text answer. Returns `None` if no credentials, no text in the final
-    reply, or the loop exceeds `CHAT_MAX_ITERATIONS`.
+    final text answer.
+
+    `pending` is the bot's per-process Map of pending write proposals. Write
+    tools (log_meal/edit_meal/delete_meal) mutate it in place; the caller
+    diffs before/after to know which proposals to surface as Confirm/Cancel
+    keyboards.
+
+    `image_bytes` + `mime_type` make the model see the image as part of the
+    initial user turn — passed through to Claude as a base64 image content
+    block. The bytes are never persisted (the bot drops them after this
+    call returns).
+
+    Returns `None` if no credentials, no text in the final reply, or the
+    loop exceeds `CHAT_MAX_ITERATIONS`.
     """
     auth = resolve_anthropic_auth(cfg)
     if not auth.has_creds:
         log.warning("No Anthropic credentials — set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN")
         return None
+    if pending is None:
+        pending = {}
 
     client = build_anthropic_client(auth)
     system = build_system_prompt(
         auth, _CHAT_SYSTEM_TEMPLATE.format(today=date.today().isoformat())
     )
-    messages: list[dict] = [{"role": "user", "content": user_text}]
 
-    for iteration in range(CHAT_MAX_ITERATIONS):
+    if image_bytes is not None:
+        user_content: Any = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type or "image/jpeg",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            },
+            {"type": "text", "text": user_text or "What's in this photo? Log it if it's a meal."},
+        ]
+    else:
+        user_content = user_text
+
+    messages: list[dict] = [{"role": "user", "content": user_content}]
+
+    for _ in range(CHAT_MAX_ITERATIONS):
         response = client.messages.create(
             model=cfg.claude_model or DEFAULT_MODEL,
             max_tokens=1024,
@@ -509,8 +736,6 @@ def chat(cfg: Config, user_text: str) -> str | None:
         )
 
         if getattr(response, "stop_reason", None) == "tool_use":
-            # Append the assistant turn (the SDK content list serializes itself
-            # back through the API) and execute every tool_use block.
             messages.append({"role": "assistant", "content": list(response.content)})
             tool_results: list[dict] = []
             for block in response.content:
@@ -524,8 +749,8 @@ def chat(cfg: Config, user_text: str) -> str | None:
                 )
                 input_data = _block_input(block)
                 try:
-                    result = _execute_chat_tool(name, input_data, cfg)
-                except Exception as e:  # noqa: BLE001 — surface as tool error to Claude
+                    result = _execute_chat_tool(name, input_data, cfg, pending)
+                except Exception as e:  # noqa: BLE001 — surface as tool error
                     log.exception("Chat tool %s raised", name)
                     result = {"error": str(e)}
                 tool_results.append({
@@ -538,7 +763,6 @@ def chat(cfg: Config, user_text: str) -> str | None:
             messages.append({"role": "user", "content": tool_results})
             continue
 
-        # Anything else (end_turn, stop_sequence, max_tokens) — collect text.
         texts: list[str] = []
         for block in response.content:
             btype = getattr(block, "type", None) or (

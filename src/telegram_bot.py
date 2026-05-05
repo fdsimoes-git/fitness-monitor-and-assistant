@@ -1,20 +1,27 @@
-"""Telegram inbound listener for the meal-logging bot.
+"""Chat-first Telegram listener for the fitness/nutrition assistant.
 
 Single-user, raw `requests`-based long-polling. Mirrors the outbound style
 in `alerts.py` so we don't pull in a heavyweight Telegram library.
 
+The bot is now a chat agent (mirroring asset-management's financial advisor):
+plain text and photos are forwarded to `llm.chat()` with the full 12-tool
+surface — read tools (balance, meals, trends, readiness, training intel),
+plus four write tools (`log_meal`, `edit_meal`, `delete_meal`,
+`lookup_barcode`). Write tools follow the same validate-and-stash pattern as
+asset-management's `editEntry` / `deleteEntry`: the tool parks a proposal
+in the per-process `pending` dict; the bot diffs `pending` before/after the
+chat call and surfaces a Confirm/Cancel inline keyboard for each new
+proposal. Actual `db.insert_meal` / `db.update_meal` / `db.delete_meal`
+calls only fire when the user taps ✅.
+
 Dispatch tree
 ─────────────
-  /help, /start                           → static help text
-  /today, /balance                        → today's calorie balance
-  numeric ^\\d{8,14}$                       → barcode → Open Food Facts → auto-insert
-  any other text                          → Claude text extractor → auto-insert
-  photo                                   → Claude vision; if a barcode is in
-                                            frame we route through OFF, otherwise
-                                            we use the visual estimate. Either
-                                            way we surface a Confirm/Cancel
-                                            inline keyboard before persisting.
-  callback_query (confirm:UUID/cancel:UUID) → flush or drop pending entry
+  /help, /start                            → static help text
+  /today, /balance                         → fast-path: today's calorie balance
+  numeric ^\\d{8,14}$                        → fast-path: OFF lookup → propose log
+  any other text (with or without caption) → llm.chat() → propose / answer
+  photo (with or without caption)          → llm.chat(image_bytes=…) → propose / answer
+  callback_query (confirm:UUID/cancel:UUID) → execute or drop a pending action
 
 Photo bytes are passed to Claude in-memory and **discarded** — no SHA-256
 cache, no blob columns, nothing that would let raw inputs leak into SQLite.
@@ -48,24 +55,25 @@ MAX_BACKOFF_S = 60.0
 BARCODE_PATTERN = re.compile(r"^\d{8,14}$")
 
 HELP_TEXT = (
-    "*garmin-monitor bot*\n\n"
-    "Log meals — send any of (I'll always ask before saving):\n"
-    "• A meal description (e.g. _\"oat porridge with banana, ~350 kcal\"_)\n"
-    "• A *photo* of your food or a packaged product\n"
-    "• A product *barcode* (8–14 digits)\n\n"
-    "Ask questions about your data:\n"
-    "• `/ask How's my protein this week?`\n"
-    "• `/ask Should I train hard today?`\n"
-    "• `/ask What did I eat yesterday?`\n\n"
-    "Commands:\n"
+    "*garmin-monitor — fitness & nutrition assistant*\n\n"
+    "Just chat with me. I have read access to your Garmin metrics + meal log "
+    "and can log, edit, or delete meals on your behalf (always with a "
+    "Confirm/Cancel before any change).\n\n"
+    "*Logging meals*\n"
+    "• Describe it: _\"oat porridge with banana, ~350 kcal\"_\n"
+    "• Send a *photo* — I estimate macros or read the barcode\n"
+    "• Send a *barcode* (8–14 digits) — I scale Open Food Facts data\n\n"
+    "*Editing*\n"
+    "• _\"delete the snack from yesterday\"_\n"
+    "• _\"change meal 12 to 250 kcal\"_\n\n"
+    "*Asking*\n"
+    "• _\"how's my protein this week?\"_\n"
+    "• _\"should I train hard today?\"_\n"
+    "• _\"what did I eat yesterday?\"_\n\n"
+    "*Commands* (fast paths)\n"
     "/help — this message\n"
     "/today — today's calorie balance\n"
-    "/balance — alias for /today\n"
-    "/ask <question> — chat with your data (alias: /chat)"
-)
-
-ASK_USAGE = (
-    "Send a question after the command, e.g. \"/ask Should I train hard today?\""
+    "/balance — alias for /today"
 )
 
 
@@ -168,6 +176,7 @@ def _handle_text(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) -> 
     if not text:
         return
 
+    # Fast-path commands (deterministic, no Claude call):
     if text in ("/help", "/start"):
         alerts.send_telegram(cfg, HELP_TEXT)
         return
@@ -175,54 +184,12 @@ def _handle_text(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) -> 
         bal = db.calorie_balance_for_date(cfg.db_path, date.today().isoformat(), cfg=cfg)
         alerts.send_telegram(cfg, _format_balance(bal))
         return
-    if text.startswith(("/ask", "/chat")):
-        _handle_ask(cfg, text)
-        return
     if BARCODE_PATTERN.match(text):
         _propose_barcode(cfg, text, pending)
         return
 
-    meal = llm.extract_meal_from_text(cfg, text)
-    if meal is None:
-        _send_plain(cfg, "Sorry — I couldn't extract a meal from that. Try /help.")
-        return
-    meal.setdefault("source", "text")
-    _offer_confirmation(cfg, meal, pending)
-
-
-def _handle_ask(cfg: Config, raw: str) -> None:
-    """Strip the leading /ask or /chat command and route the rest to llm.chat."""
-    parts = raw.split(maxsplit=1)
-    body = parts[1].strip() if len(parts) > 1 else ""
-    if not body:
-        _send_plain(cfg, ASK_USAGE)
-        return
-    answer = llm.chat(cfg, body)
-    if not answer:
-        _send_plain(
-            cfg,
-            "I couldn't reach Claude (check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN) "
-            "or didn't get an answer back. Try a more specific question.",
-        )
-        return
-    # Telegram caps text messages at 4096 chars; truncate defensively.
-    if len(answer) > 4000:
-        answer = answer[:4000].rstrip() + "\n\n[…truncated]"
-    _send_plain(cfg, answer)
-
-
-def _propose_barcode(cfg: Config, barcode: str, pending: dict[str, dict[str, Any]]) -> None:
-    info = food.lookup_barcode(barcode)
-    if info is None:
-        _send_plain(cfg, f"Barcode {barcode} not found in Open Food Facts.")
-        return
-    meal = food.meal_from_barcode_info(info, barcode)
-    _offer_confirmation(cfg, meal, pending)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Photo flow
-# ──────────────────────────────────────────────────────────────────────────────
+    # Default: chat with the full tool surface.
+    _run_chat(cfg, text, pending)
 
 
 def _handle_photo(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) -> None:
@@ -234,43 +201,109 @@ def _handle_photo(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) ->
     if image_bytes is None:
         _send_plain(cfg, "Couldn't download that photo from Telegram.")
         return
-
-    result = llm.extract_meal_from_photo(cfg, image_bytes, mime_type)
-    # Drop the buffer reference now — no persistence, no caching.
+    caption = (msg.get("caption") or "").strip()
+    _run_chat(cfg, caption, pending, image_bytes=image_bytes, mime_type=mime_type)
+    # Reference released here; no persistence anywhere.
     del image_bytes
 
-    if result is None:
+
+def _run_chat(
+    cfg: Config,
+    user_text: str,
+    pending: dict[str, dict[str, Any]],
+    *,
+    image_bytes: bytes | None = None,
+    mime_type: str | None = None,
+) -> None:
+    """Dispatch to llm.chat() and surface a Confirm/Cancel keyboard for any
+    write proposals it parked in `pending`. The chat reply (when present) is
+    sent first; keyboards follow."""
+    pending_before = set(pending.keys())
+    answer = llm.chat(
+        cfg, user_text, pending,
+        image_bytes=image_bytes, mime_type=mime_type,
+    )
+    new_pids = [pid for pid in pending if pid not in pending_before]
+
+    if answer:
+        if len(answer) > 4000:
+            answer = answer[:4000].rstrip() + "\n\n[…truncated]"
+        _send_plain(cfg, answer)
+    elif not new_pids:
+        # No reply and no proposal → make sure the user knows something's off.
         _send_plain(
             cfg,
-            "Sorry — I couldn't read that meal. Try a clearer angle, send a barcode, "
-            "or describe it in text.",
+            "I couldn't reach Claude (check ANTHROPIC_API_KEY / "
+            "CLAUDE_CODE_OAUTH_TOKEN) or didn't get a useful response.",
         )
+
+    for pid in new_pids:
+        _surface_pending(cfg, pid, pending[pid])
+
+
+def _propose_barcode(cfg: Config, barcode: str, pending: dict[str, dict[str, Any]]) -> None:
+    """Fast-path for a numeric-only message that parses as an EAN/UPC."""
+    info = food.lookup_barcode(barcode)
+    if info is None:
+        _send_plain(cfg, f"Barcode {barcode} not found in Open Food Facts.")
         return
-
-    if result.get("kind") == "barcode":
-        info = food.lookup_barcode(result["barcode"])
-        if info is None:
-            _send_plain(cfg, f"Spotted barcode {result['barcode']} but it's not in Open Food Facts.")
-            return
-        proposed = food.meal_from_barcode_info(info, result["barcode"])
-    else:
-        proposed = dict(result.get("meal") or {})
-        proposed.setdefault("source", "photo")
-
-    _offer_confirmation(cfg, proposed, pending)
-
-
-def _offer_confirmation(
-    cfg: Config, meal: dict, pending: dict[str, dict[str, Any]]
-) -> None:
+    meal = food.meal_from_barcode_info(info, barcode)
     pid = uuid.uuid4().hex[:10]
     _sweep_pending(pending)
-    pending[pid] = {"meal": meal, "ts": time.time()}
+    pending[pid] = {"action": "insert", "meal": meal, "ts": time.time()}
+    _surface_pending(cfg, pid, pending[pid])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Photo flow
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _surface_pending(
+    cfg: Config, pid: str, entry: dict[str, Any],
+) -> None:
+    """Render a Confirm/Cancel inline keyboard for a parked proposal.
+
+    The button text and the message body adapt to `entry["action"]` so the
+    user sees a different prompt for inserts vs edits vs deletes — but the
+    callback_data shape (`confirm:UUID` / `cancel:UUID`) is uniform so the
+    callback handler doesn't need to know about action types.
+    """
+    action = entry.get("action", "insert")
+    confirm_label, cancel_label, body = _confirmation_text(action, entry)
     keyboard = [[
-        {"text": "✅ Log it", "callback_data": f"confirm:{pid}"},
-        {"text": "❌ Cancel", "callback_data": f"cancel:{pid}"},
+        {"text": confirm_label, "callback_data": f"confirm:{pid}"},
+        {"text": cancel_label, "callback_data": f"cancel:{pid}"},
     ]]
-    _send_with_keyboard(cfg, f"Proposed: {_format_meal_summary(meal)}\n\nLog it?", keyboard)
+    _send_with_keyboard(cfg, body, keyboard)
+
+
+def _confirmation_text(action: str, entry: dict[str, Any]) -> tuple[str, str, str]:
+    if action == "insert":
+        meal = entry.get("meal") or {}
+        return (
+            "✅ Log it",
+            "❌ Cancel",
+            f"Log this meal?\n\n{_format_meal_summary(meal)}",
+        )
+    if action == "edit":
+        before = entry.get("before") or {}
+        fields = entry.get("fields") or {}
+        before_summary = _format_meal_summary(before)
+        change_lines = "\n".join(f"  {k}: {before.get(k, '—')} → {v}" for k, v in fields.items())
+        return (
+            "✏️ Apply edit",
+            "❌ Cancel",
+            f"Edit meal #{entry.get('meal_id')}?\n\nWas: {before_summary}\nChanges:\n{change_lines}",
+        )
+    if action == "delete":
+        before = entry.get("before") or {}
+        return (
+            "🗑 Delete",
+            "❌ Cancel",
+            f"Delete meal #{entry.get('meal_id')}?\n\n{_format_meal_summary(before)}",
+        )
+    return ("✅ Confirm", "❌ Cancel", f"Confirm pending {action}?")
 
 
 def _sweep_pending(pending: dict[str, dict[str, Any]], ttl: float = PENDING_TTL_SECONDS) -> None:
@@ -315,17 +348,38 @@ def _handle_callback(
         return
 
     if action == "confirm":
-        meal = entry["meal"]
-        db.insert_meal(cfg.db_path, meal)
-        _answer_callback(cfg, callback_id, "Logged")
+        ack, summary = _apply_pending(cfg, entry)
+        _answer_callback(cfg, callback_id, ack)
         if chat_id and msg_id:
-            _edit_message_remove_keyboard(
-                cfg, chat_id, msg_id, f"✅ Logged: {_format_meal_summary(meal)}"
-            )
+            _edit_message_remove_keyboard(cfg, chat_id, msg_id, summary)
     else:  # cancel
         _answer_callback(cfg, callback_id, "Cancelled")
         if chat_id and msg_id:
             _edit_message_remove_keyboard(cfg, chat_id, msg_id, "❌ Cancelled.")
+
+
+def _apply_pending(cfg: Config, entry: dict[str, Any]) -> tuple[str, str]:
+    """Execute a confirmed pending action against the DB. Returns (callback_ack, message_text)."""
+    action = entry.get("action", "insert")
+    if action == "insert":
+        meal = entry.get("meal") or {}
+        db.insert_meal(cfg.db_path, meal)
+        return "Logged", f"✅ Logged: {_format_meal_summary(meal)}"
+    if action == "edit":
+        meal_id = entry.get("meal_id")
+        fields = entry.get("fields") or {}
+        ok = db.update_meal(cfg.db_path, int(meal_id), fields)
+        if not ok:
+            return "Edit failed", f"⚠️ Couldn't apply edit to meal #{meal_id} (no matching row)."
+        return "Updated", f"✏️ Updated meal #{meal_id}: {', '.join(fields.keys())}"
+    if action == "delete":
+        meal_id = entry.get("meal_id")
+        before = entry.get("before") or {}
+        ok = db.delete_meal(cfg.db_path, int(meal_id))
+        if not ok:
+            return "Delete failed", f"⚠️ Meal #{meal_id} was already gone."
+        return "Deleted", f"🗑 Deleted meal #{meal_id}: {_format_meal_summary(before)}"
+    return "Unknown action", f"⚠️ Don't know how to apply action '{action}'."
 
 
 # ──────────────────────────────────────────────────────────────────────────────
