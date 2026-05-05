@@ -1,10 +1,11 @@
 """Higher-level alert checks that run on each poll.
 
-Three independent checks:
+Independent checks driven by the daily_summary table the poller populates:
 
-1. HR-while-resting — average BPM over a recent night-hours window is high.
-2. Resting-HR trend — resting_hr climbed strictly for 5 days in a row.
-3. HRV drop — last night's HRV is >20% below the 7-day baseline.
+1. Resting-HR trend — resting_hr climbed strictly for 5 days in a row.
+2. HRV drop — last night's HRV is >20% below the 7-day baseline.
+3. Illness / overtraining — RHR ↑ AND HRV ↓ for 2+ consecutive days.
+4. Training window — daily HRV vs baseline drives a "ready" / "recovery" tip.
 
 All checks are pure-ish: they accept the data they need (or pull it from
 db.py) and call alerts.maybe_alert() with cooldowns enforced by kind.
@@ -12,17 +13,11 @@ db.py) and call alerts.maybe_alert() with cooldowns enforced by kind.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time, timedelta, timezone
 
 from . import alerts, db
 from .config import Config
 
 log = logging.getLogger(__name__)
-
-# Hours considered "should be resting" for the HR-while-resting heuristic.
-# Local-time. 23:00 through 06:00 covers most overnight wear.
-REST_HOUR_START = 23
-REST_HOUR_END = 6  # exclusive
 
 # Trend params
 TREND_DAYS = 5
@@ -31,9 +26,6 @@ TREND_DAYS = 5
 HRV_BASELINE_DAYS = 7
 HRV_DROP_FRACTION = 0.20  # 20%
 HRV_MIN_BASELINE_SAMPLES = 4  # avoid spurious alerts after a few days of data
-
-# HR-while-resting params
-REST_WINDOW_MIN_SAMPLES = 10  # need this many BLE points to trust the avg
 
 # Illness / overtraining (Buchheit 2014, Plews 2013): RHR ↑ AND HRV ↓ on 2+ days.
 ILLNESS_BASELINE_DAYS = 7
@@ -109,61 +101,6 @@ def check_hrv_drop(cfg: Config) -> bool:
             "baseline": baseline,
             "drop_fraction": drop_fraction,
         },
-    )
-
-
-def _last_rest_window_utc(now_local: datetime) -> tuple[datetime, datetime]:
-    """Return (start_utc, end_utc) for the most recent fully-elapsed rest window.
-
-    If we've already passed REST_HOUR_END today, that's [yesterday 23:00, today 06:00].
-    Otherwise it's [day-before 23:00, yesterday 06:00].
-    """
-    today_local = now_local.date()
-    if now_local.time() >= time(REST_HOUR_END, 0):
-        end_local = datetime.combine(today_local, time(REST_HOUR_END, 0))
-    else:
-        end_local = datetime.combine(today_local - timedelta(days=1), time(REST_HOUR_END, 0))
-    start_local = end_local - timedelta(hours=24 - REST_HOUR_START + REST_HOUR_END)
-
-    # Naive local datetimes; .astimezone() interprets them as system-local then -> UTC.
-    return (
-        start_local.astimezone().astimezone(timezone.utc),
-        end_local.astimezone().astimezone(timezone.utc),
-    )
-
-
-def check_hr_while_resting(cfg: Config, *, now: datetime | None = None) -> bool:
-    """High average BPM during the night-hours window.
-
-    Uses BLE-recorded HR. If the user did not wear the watch overnight, the
-    sample count will be below the floor and the check is skipped.
-    """
-    now_local = now or datetime.now().astimezone()
-    start_utc, end_utc = _last_rest_window_utc(now_local)
-
-    result = db.avg_hr_between(
-        cfg.db_path,
-        start_utc.isoformat(timespec="seconds"),
-        end_utc.isoformat(timespec="seconds"),
-    )
-    if result is None:
-        return False
-    avg_bpm, n = result
-    if n < REST_WINDOW_MIN_SAMPLES:
-        return False
-    if avg_bpm < cfg.hr_resting_high_bpm:
-        return False
-
-    text = (
-        f"🌙 Night-time HR elevated: avg *{avg_bpm:.0f}* bpm "
-        f"({REST_HOUR_START:02d}:00–{REST_HOUR_END:02d}:00, "
-        f"n={n}, threshold {cfg.hr_resting_high_bpm})"
-    )
-    return alerts.maybe_alert(
-        cfg,
-        kind="hr_resting_window",
-        text=text,
-        payload={"avg_bpm": avg_bpm, "samples": n},
     )
 
 
@@ -277,7 +214,6 @@ def run_smart_alerts(cfg: Config) -> None:
     checks = (
         check_resting_hr_trend,
         check_hrv_drop,
-        check_hr_while_resting,
         check_illness_risk,
         check_training_window,
     )

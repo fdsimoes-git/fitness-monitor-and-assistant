@@ -20,7 +20,6 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init-db", help="Create tables in SQLite")
-    sub.add_parser("ble", help="Run the BLE HR listener (blocks)")
     sub.add_parser("poll", help="Run one Garmin Connect poll")
     sub.add_parser("test-alert", help="Send a Telegram test message")
     digest_p = sub.add_parser("digest", help="Send the daily Telegram digest")
@@ -31,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     dash_p = sub.add_parser("dashboard", help="Run the FastAPI dashboard (optional)")
     dash_p.add_argument("--host", default="127.0.0.1")
     dash_p.add_argument("--port", type=int, default=8000)
-    prune_p = sub.add_parser("prune", help="Delete old hr_realtime/hrv/activities rows and VACUUM")
+    prune_p = sub.add_parser("prune", help="Delete old activities/meals rows and VACUUM")
     prune_p.add_argument("--days", type=int, default=90, help="Retention window in days (default 90)")
     act_p = sub.add_parser("activities", help="Print recent activities from the DB")
     act_p.add_argument("--days", type=int, default=14, help="Window in days (default 14)")
@@ -42,6 +41,14 @@ def main(argv: list[str] | None = None) -> int:
     log_meal_p.add_argument("--protein", type=float)
     log_meal_p.add_argument("--carbs", type=float)
     log_meal_p.add_argument("--fat", type=float)
+    log_meal_p.add_argument("--fiber", type=float, help="Fiber in grams")
+    log_meal_p.add_argument("--sugars", type=float, help="Sugars in grams")
+    log_meal_p.add_argument("--saturated-fat", type=float, help="Saturated fat in grams")
+    log_meal_p.add_argument("--sodium", type=float, help="Sodium in mg")
+    log_meal_p.add_argument(
+        "--category",
+        help="Coarse food category (e.g. 'Vegetables', 'Sugary snacks')",
+    )
     log_meal_p.add_argument("--meal-time", help="ISO timestamp (defaults to now)")
 
     log_bc_p = sub.add_parser("log-barcode", help="Lookup a barcode and log a meal")
@@ -71,15 +78,6 @@ def main(argv: list[str] | None = None) -> int:
         print("Sent" if ok else "Failed (check logs)")
         return 0 if ok else 1
 
-    if args.cmd == "ble":
-        import asyncio
-        from . import ble_listener
-        try:
-            asyncio.run(ble_listener.run(cfg))
-        except KeyboardInterrupt:
-            log.info("Stopped by user")
-        return 0
-
     if args.cmd == "poll":
         from . import garmin_poller
         garmin_poller.run_once(cfg)
@@ -103,8 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         with db.connect(cfg.db_path) as conn:
             deleted = db.prune_old_data(conn, days=args.days)
         print(
-            f"Pruned (>{args.days}d): hr_realtime={deleted['hr_realtime']} "
-            f"hrv={deleted['hrv']} activities={deleted['activities']} "
+            f"Pruned (>{args.days}d): activities={deleted['activities']} "
             f"meals={deleted['meals']}"
         )
         return 0
@@ -140,6 +137,11 @@ def main(argv: list[str] | None = None) -> int:
             "protein_g": args.protein,
             "carbs_g": args.carbs,
             "fat_g": args.fat,
+            "fiber_g": args.fiber,
+            "sugars_g": args.sugars,
+            "saturated_fat_g": args.saturated_fat,
+            "sodium_mg": args.sodium,
+            "food_category": args.category,
             "meal_time": args.meal_time,
         }
         mid = db.insert_meal(cfg.db_path, meal)
@@ -170,6 +172,11 @@ def main(argv: list[str] | None = None) -> int:
             "protein_g": _scale(info.get("protein_100g")),
             "carbs_g": _scale(info.get("carbs_100g")),
             "fat_g": _scale(info.get("fat_100g")),
+            "fiber_g": _scale(info.get("fiber_100g")),
+            "sugars_g": _scale(info.get("sugars_100g")),
+            "saturated_fat_g": _scale(info.get("saturated_fat_100g")),
+            "sodium_mg": _scale(info.get("sodium_mg_100g")),
+            "food_category": info.get("food_category"),
             "meal_time": args.meal_time,
             "raw_json": json.dumps(info.get("raw") or {}),
         }

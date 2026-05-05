@@ -1,15 +1,12 @@
 """Daily digest: a one-shot Telegram message summarizing yesterday's metrics.
 
 Run from a systemd timer at e.g. 08:00 local time. Reads yesterday's row
-from `daily_summary` plus the same-day HRV samples from `hrv` and posts a
-short Markdown message via the Telegram bot.
+from `daily_summary` and posts a short Markdown message via the Telegram bot.
 """
 from __future__ import annotations
 
 import logging
-import sqlite3
-from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
+from datetime import date, timedelta
 
 from . import db
 from .alerts import send_telegram
@@ -24,25 +21,6 @@ def _format_seconds(seconds: int | None) -> str:
     h, rem = divmod(int(seconds), 3600)
     m = rem // 60
     return f"{h}h{m:02d}m"
-
-
-def _ble_hrv_avg_for_date(db_path: Path, target_date: date) -> float | None:
-    """Average RMSSD across BLE-derived HRV samples landing on target_date (local)."""
-    start = datetime.combine(target_date, time(0, 0)).astimezone()
-    end = start + timedelta(days=1)
-    start_iso = start.astimezone(timezone.utc).isoformat(timespec="seconds")
-    end_iso = end.astimezone(timezone.utc).isoformat(timespec="seconds")
-
-    with db.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT AVG(rmssd_ms) AS avg, COUNT(*) AS n FROM hrv "
-            "WHERE ts >= ? AND ts < ?",
-            (start_iso, end_iso),
-        ).fetchone()
-    if not row or not row["n"]:
-        return None
-    return float(row["avg"])
 
 
 _ACTIVITY_EMOJI = {
@@ -79,11 +57,10 @@ def build_digest(cfg: Config, target_date: date | None = None) -> str | None:
     """Build the digest text. Returns None if no data exists for the target date."""
     target_date = target_date or (date.today() - timedelta(days=1))
     summary = db.daily_summary_for(cfg.db_path, target_date.isoformat())
-    ble_hrv = _ble_hrv_avg_for_date(cfg.db_path, target_date)
     activities = db.activities_for_date(cfg.db_path, target_date.isoformat())
     meals = db.meals_for_date(cfg.db_path, target_date.isoformat())
 
-    if not summary and ble_hrv is None and not activities and not meals:
+    if not summary and not activities and not meals:
         return None
 
     s = summary or {}
@@ -99,8 +76,6 @@ def build_digest(cfg: Config, target_date: date | None = None) -> str | None:
         f"• Body battery: {s.get('body_battery') or '—'}",
         f"• HRV (overnight): {s.get('hrv_overnight') or '—'} ms",
     ]
-    if ble_hrv is not None:
-        lines.append(f"• HRV (BLE day avg): {ble_hrv:.0f} ms")
     if activities:
         lines.append("")
         for a in activities:

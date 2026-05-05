@@ -44,57 +44,227 @@ ACTIVITY_EMOJI = {
 }
 
 ALERT_COLORS = {
-    "illness_risk": "bg-red-900/50 border-red-700 text-red-200",
-    "training_ready": "bg-emerald-900/50 border-emerald-700 text-emerald-200",
-    "recovery_day": "bg-amber-900/50 border-amber-700 text-amber-200",
-    "hrv_drop": "bg-amber-900/50 border-amber-700 text-amber-200",
-    "resting_hr_trend": "bg-amber-900/50 border-amber-700 text-amber-200",
-    "resting_hr_high": "bg-amber-900/50 border-amber-700 text-amber-200",
-    "hr_resting_window": "bg-orange-900/50 border-orange-700 text-orange-200",
+    "illness_risk": "border-magenta text-magenta-200 bg-magenta-glass",
+    "training_ready": "border-lime text-lime-200 bg-lime-glass",
+    "recovery_day": "border-amber text-amber-200 bg-amber-glass",
+    "hrv_drop": "border-amber text-amber-200 bg-amber-glass",
+    "resting_hr_trend": "border-amber text-amber-200 bg-amber-glass",
+    "resting_hr_high": "border-amber text-amber-200 bg-amber-glass",
 }
 
 ROLLING_WINDOW = 7
+
+# Heatmap colour scale (low → high readiness). Empty cells use gray.
+_HEATMAP_PALETTE = ["#1a1f2e", "#2d1640", "#5a1f4d", "#a8264e", "#ff2e88", "#ffb300", "#adfa3c", "#00f5ff"]
 
 INDEX_HTML = """<!doctype html>
 <html lang=en>
 <head>
   <meta charset=utf-8>
   <meta name=viewport content="width=device-width,initial-scale=1">
-  <title>🌙 Garmin Monitor</title>
+  <title>VITALS · Garmin Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/countup.js@2.8.0/dist/countUp.umd.js"></script>
   <script src="https://unpkg.com/htmx.org@1.9.10"></script>
   <style>
-    body { background: #0b1020; color: #e5e7eb; font-family: ui-sans-serif, system-ui, sans-serif; }
-    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 1rem; }
-    .stat-num { font-size: 1.85rem; font-weight: 700; line-height: 1.1; }
-    .stat-label { color: #9ca3af; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }
+    :root {
+      --ink-0: #05060a;
+      --ink-1: #0a0d18;
+      --ink-2: #11162a;
+      --ink-3: #1a2030;
+      --line: #1f2740;
+      --text: #e8edf2;
+      --muted: #6a7282;
+
+      --cyan: #00f5ff;
+      --lime: #adfa3c;
+      --amber: #ffb300;
+      --magenta: #ff2e88;
+      --violet: #a78bfa;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      background: var(--ink-0);
+      color: var(--text);
+      font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+      font-feature-settings: 'cv11', 'ss01', 'ss03';
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background:
+        radial-gradient(circle at 15% 20%, rgba(0, 245, 255, 0.05), transparent 35%),
+        radial-gradient(circle at 85% 80%, rgba(255, 46, 136, 0.05), transparent 40%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    main, header { position: relative; z-index: 1; }
+    code, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+    /* — Card primitive — */
+    .card {
+      position: relative;
+      background: linear-gradient(180deg, var(--ink-1) 0%, var(--ink-0) 100%);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 1.1rem 1.2rem;
+      overflow: hidden;
+    }
+    .card::before {
+      content: ''; position: absolute; inset: 0 0 auto 0; height: 2px;
+      background: linear-gradient(90deg, var(--card-accent, transparent), transparent 70%);
+      opacity: 0.85;
+    }
+    .card[data-cat=recovery]  { --card-accent: var(--cyan); }
+    .card[data-cat=training]  { --card-accent: var(--lime); }
+    .card[data-cat=nutrition] { --card-accent: var(--amber); }
+    .card[data-cat=alerts]    { --card-accent: var(--magenta); }
+    .card[data-cat=sleep]     { --card-accent: var(--violet); }
+
+    /* — Typography — */
+    .stat-num {
+      font-family: 'Inter', sans-serif;
+      font-weight: 800;
+      font-size: 2.6rem;
+      line-height: 1;
+      letter-spacing: -0.02em;
+    }
+    .stat-num-sm { font-size: 1.6rem; font-weight: 700; line-height: 1; letter-spacing: -0.01em; }
+    .stat-label {
+      color: var(--muted);
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+    }
+    .display-num {
+      font-family: 'Inter', sans-serif;
+      font-weight: 900;
+      font-size: 5.5rem;
+      line-height: 0.9;
+      letter-spacing: -0.04em;
+    }
+
+    /* — Pills / badges — */
+    .pill {
+      display: inline-flex; align-items: center; gap: 0.35rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.7rem; font-weight: 700;
+      letter-spacing: 0.06em; text-transform: uppercase;
+      border: 1px solid;
+    }
+    .pill-cyan    { color: var(--cyan);    border-color: rgba(0,245,255,0.4);    background: rgba(0,245,255,0.08); }
+    .pill-lime    { color: var(--lime);    border-color: rgba(173,250,60,0.4);   background: rgba(173,250,60,0.08); }
+    .pill-amber   { color: var(--amber);   border-color: rgba(255,179,0,0.4);    background: rgba(255,179,0,0.10); }
+    .pill-magenta { color: var(--magenta); border-color: rgba(255,46,136,0.4);   background: rgba(255,46,136,0.08); }
+    .pill-muted   { color: var(--muted);   border-color: var(--line);            background: transparent; }
+
+    /* Glassy alert chip backgrounds (used by ALERT_COLORS) */
+    .border-magenta { border-color: rgba(255,46,136,0.5); }
+    .border-amber   { border-color: rgba(255,179,0,0.5); }
+    .border-lime    { border-color: rgba(173,250,60,0.5); }
+    .text-magenta-200 { color: #ffb6d1; }
+    .text-amber-200   { color: #ffd97a; }
+    .text-lime-200    { color: #d3f487; }
+    .bg-magenta-glass { background: rgba(255,46,136,0.07); }
+    .bg-amber-glass   { background: rgba(255,179,0,0.07); }
+    .bg-lime-glass    { background: rgba(173,250,60,0.07); }
+
+    /* — Glow effect — */
+    .glow-cyan    { filter: drop-shadow(0 0 6px rgba(0,245,255,0.6)); }
+    .glow-lime    { filter: drop-shadow(0 0 6px rgba(173,250,60,0.55)); }
+    .glow-amber   { filter: drop-shadow(0 0 6px rgba(255,179,0,0.55)); }
+    .glow-magenta { filter: drop-shadow(0 0 6px rgba(255,46,136,0.55)); }
+
+    /* — Sparkline — */
+    .sparkline-wrap { position: absolute; left: 0; right: 0; bottom: 0; height: 38px; opacity: 0.7; pointer-events: none; }
     canvas { max-height: 320px; }
+
+    /* — Year heatmap — */
+    .heatmap-cell {
+      width: 11px; height: 11px;
+      border-radius: 2px;
+      transition: transform 0.12s ease;
+    }
+    .heatmap-cell:hover { transform: scale(1.6); outline: 1px solid var(--cyan); }
+
+    /* — Meal timing strip — */
+    .timing-strip {
+      position: relative;
+      height: 56px;
+      background: linear-gradient(90deg, var(--ink-2) 0%, var(--ink-0) 100%);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .timing-mark {
+      position: absolute;
+      top: 50%; transform: translate(-50%, -50%);
+      width: 14px; height: 14px;
+      border-radius: 999px;
+      background: radial-gradient(circle, var(--amber) 0%, rgba(255,179,0,0.2) 70%, transparent 100%);
+      box-shadow: 0 0 12px rgba(255,179,0,0.7);
+    }
+    .timing-tick {
+      position: absolute; top: 0; bottom: 0; width: 1px;
+      background: rgba(255,255,255,0.05);
+    }
+
+    /* — Macro ring — */
+    .ring-track  { stroke: var(--ink-3); }
+    .ring-fill-p { stroke: var(--lime);  filter: drop-shadow(0 0 4px rgba(173,250,60,0.6)); }
+    .ring-fill-c { stroke: var(--amber); filter: drop-shadow(0 0 4px rgba(255,179,0,0.6)); }
+    .ring-fill-f { stroke: var(--magenta); filter: drop-shadow(0 0 4px rgba(255,46,136,0.55)); }
+    .ring-fill-readiness { stroke: var(--cyan); filter: drop-shadow(0 0 8px rgba(0,245,255,0.65)); }
+
+    /* — Top-line title — */
+    h1 .accent { color: var(--cyan); text-shadow: 0 0 8px rgba(0,245,255,0.4); }
+    h2.section-title {
+      font-size: 0.78rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.18em;
+      color: var(--muted);
+      margin-bottom: 0.5rem;
+    }
+    h2.section-title::before {
+      content: ''; display: inline-block;
+      width: 24px; height: 1px;
+      background: currentColor; vertical-align: middle;
+      margin-right: 0.5rem;
+    }
   </style>
 </head>
 <body class="min-h-screen">
-  <header class="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
+  <header class="px-6 py-4 border-b border-[color:var(--line)] flex items-center justify-between">
     <div>
-      <h1 class="text-xl font-bold">🌙 Garmin Monitor</h1>
-      <p class="text-xs text-gray-400">Pi: __HOSTNAME__ · last refresh
-        <span id="last-refresh" class="text-gray-300">—</span></p>
+      <h1 class="text-2xl font-extrabold tracking-tight">VITALS<span class="accent">.</span></h1>
+      <p class="text-xs mono text-[color:var(--muted)] mt-0.5">
+        host <span class="text-[color:var(--text)]">__HOSTNAME__</span> ·
+        last sync <span id="last-refresh" class="text-[color:var(--text)]">—</span>
+      </p>
     </div>
     <button onclick="window.location.reload()"
-            class="px-3 py-1.5 text-xs rounded bg-gray-800 hover:bg-gray-700 border border-gray-700">
-      Refresh now
+            class="pill pill-cyan hover:bg-[rgba(0,245,255,0.15)]">
+      ↻ Refresh
     </button>
   </header>
 
-  <main class="p-4 max-w-7xl mx-auto space-y-4"
+  <main class="px-4 md:px-6 py-6 max-w-7xl mx-auto space-y-5"
         hx-trigger="load, every 5m" hx-get="/partials/all" hx-target="#root">
-    <div id="root">Loading…</div>
+    <div id="root" class="text-[color:var(--muted)] mono text-xs">// loading vitals…</div>
   </main>
 
   <script>
-    // Re-render charts whenever HTMX swaps a partial that contains JSON-data scripts.
     document.body.addEventListener('htmx:afterSwap', () => {
       document.getElementById('last-refresh').textContent = new Date().toLocaleTimeString();
       renderAll();
@@ -115,69 +285,185 @@ INDEX_HTML = """<!doctype html>
       return out;
     }
 
-    function renderAll() {
-      renderHR();
-      renderTrend('hrvTrendChart', readJSON('hrvTrendData'), 'HRV (ms)', '#34d399');
-      renderTrend('rhrTrendChart', readJSON('rhrTrendData'), 'Resting HR (bpm)', '#f472b6');
-      renderSleepStages();
-      renderSleepDuration();
-      renderTrainingLoad();
-      renderScatter();
-      renderBodyBatterySpark();
-      renderMacros();
-    }
-
-    function renderMacros() {
-      const data = readJSON('macrosData');
-      destroyChart('macrosChart');
-      const ctx = $('macrosChart');
-      if (!ctx || !data) return;
-      charts.macrosChart = new Chart(ctx, {
-        type: 'doughnut',
-        data: {
-          labels: ['Protein (g)', 'Carbs (g)', 'Fat (g)'],
-          datasets: [{
-            data: [data.protein_g, data.carbs_g, data.fat_g],
-            backgroundColor: ['#34d399', '#fbbf24', '#f87171'],
-            borderColor: '#0b1020',
-          }],
-        },
-        options: { animation: false, plugins: { legend: { labels: { color: '#e5e7eb' } } } },
+    // — CountUp pass over every [data-countup] element after each swap —
+    function animateNumbers() {
+      document.querySelectorAll('[data-countup]').forEach(el => {
+        const target = parseFloat(el.dataset.countup);
+        if (isNaN(target)) return;
+        const decimals = parseInt(el.dataset.decimals || '0', 10);
+        const cu = new countUp.CountUp(el, target, {
+          duration: 1.0, decimalPlaces: decimals, separator: ',', useEasing: true,
+        });
+        if (!cu.error) cu.start();
       });
     }
 
-    function renderHR() {
-      const data = readJSON('hrRealtimeData') || [];
-      destroyChart('hrChart');
-      const ctx = $('hrChart');
-      if (!ctx) return;
-      charts.hrChart = new Chart(ctx, {
+    // — Stroke-dasharray progress for SVG rings declared in markup —
+    function animateRings() {
+      document.querySelectorAll('[data-ring-pct]').forEach(el => {
+        const pct = Math.max(0, Math.min(1, parseFloat(el.dataset.ringPct)));
+        const r = parseFloat(el.getAttribute('r'));
+        const circ = 2 * Math.PI * r;
+        el.style.strokeDasharray = circ;
+        el.style.strokeDashoffset = circ;
+        // animate next frame
+        requestAnimationFrame(() => {
+          el.style.transition = 'stroke-dashoffset 1.1s cubic-bezier(.6,.1,.2,1)';
+          el.style.strokeDashoffset = circ * (1 - pct);
+        });
+      });
+    }
+
+    function renderAll() {
+      animateNumbers();
+      animateRings();
+      renderTrend('hrvTrendChart', readJSON('hrvTrendData'), 'HRV (ms)', getCSS('--cyan'));
+      renderTrend('rhrTrendChart', readJSON('rhrTrendData'), 'Resting HR (bpm)', getCSS('--magenta'));
+      renderSleepStages();
+      renderSleepDuration();
+      renderTrainingLoad();
+      renderBodyBatterySpark();
+      renderStatSpark('rhrSpark', readJSON('rhrSparkData'), getCSS('--magenta'));
+      renderStatSpark('hrvSpark', readJSON('hrvSparkData'), getCSS('--cyan'));
+      renderStatSpark('stepsSpark', readJSON('stepsSparkData'), getCSS('--lime'));
+      renderStatSpark('sleepSpark', readJSON('sleepSparkData'), getCSS('--violet'));
+      renderZ2Chart();
+      renderSleepDebtChart();
+      renderBalanceChart();
+      renderMacrosLegacy();
+    }
+
+    function getCSS(varName) {
+      return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+    }
+
+    function renderStatSpark(canvasId, data, color) {
+      destroyChart(canvasId);
+      const ctx = $(canvasId);
+      if (!ctx || !data) return;
+      charts[canvasId] = new Chart(ctx, {
         type: 'line',
         data: {
+          labels: data.map(r => r.date),
           datasets: [{
-            label: 'HR (bpm)',
-            data: data.map(p => ({ x: p.t, y: p.v })),
-            borderColor: '#f87171',
-            backgroundColor: 'rgba(248,113,113,0.15)',
-            borderWidth: 1.5,
+            data: data.map(r => r.value),
+            borderColor: color,
+            backgroundColor: color + '22',
+            borderWidth: 1.4,
             pointRadius: 0,
-            tension: 0.2,
+            tension: 0.4,
+            fill: true,
+            spanGaps: true,
           }],
         },
         options: {
           animation: false,
-          parsing: false,
-          scales: {
-            x: { type: 'time', ticks: { color: '#9ca3af' }, grid: { color: '#1f2937' } },
-            y: { ticks: { color: '#9ca3af' }, grid: { color: '#1f2937' } },
-          },
+          plugins: { legend: { display: false }, tooltip: { enabled: false } },
+          scales: { x: { display: false }, y: { display: false } },
+          maintainAspectRatio: false,
+        },
+      });
+    }
+
+    function renderMacrosLegacy() { /* macro rings replaced by SVG; renderer kept as no-op for compat */ }
+
+    function renderZ2Chart() {
+      const data = readJSON('z2Data');
+      destroyChart('z2Chart');
+      const ctx = $('z2Chart');
+      if (!ctx || !data) return;
+      charts.z2Chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: data.by_day.map(d => d.date.slice(5)),
+          datasets: [{
+            label: 'Z2 minutes',
+            data: data.by_day.map(d => d.minutes),
+            backgroundColor: getCSS('--lime'),
+            borderRadius: 3,
+          }],
+        },
+        options: {
+          animation: { duration: 600 },
           plugins: {
-            legend: { labels: { color: '#e5e7eb' } },
-            zoom: {
-              pan: { enabled: true, mode: 'x' },
-              zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
+            legend: { display: false },
+            tooltip: { callbacks: { title: (items) => items[0].label } },
+          },
+          scales: {
+            x: { ticks: { color: 'rgba(232,237,242,0.5)' }, grid: { display: false } },
+            y: { ticks: { color: 'rgba(232,237,242,0.5)' }, grid: { color: 'rgba(255,255,255,0.04)' } },
+          },
+          maintainAspectRatio: false,
+        },
+      });
+    }
+
+    function renderSleepDebtChart() {
+      const data = readJSON('sleepDebtData');
+      destroyChart('sleepDebtChart');
+      const ctx = $('sleepDebtChart');
+      if (!ctx || !data) return;
+      const bars = data.by_day.map(d => d.deficit_h);
+      const colors = bars.map(v => v == null ? 'rgba(106,114,130,0.3)' : (v > 0 ? getCSS('--magenta') : getCSS('--lime')));
+      charts.sleepDebtChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: data.by_day.map(d => d.date.slice(5)),
+          datasets: [{
+            data: bars,
+            backgroundColor: colors,
+            borderRadius: 3,
+          }],
+        },
+        options: {
+          animation: { duration: 600 },
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: 'rgba(232,237,242,0.5)' }, grid: { display: false } },
+            y: {
+              ticks: { color: 'rgba(232,237,242,0.5)', callback: v => v + 'h' },
+              grid: { color: 'rgba(255,255,255,0.04)' },
+              suggestedMin: -3, suggestedMax: 3,
             },
           },
+          maintainAspectRatio: false,
+        },
+      });
+    }
+
+    function renderBalanceChart() {
+      const data = readJSON('balanceData');
+      destroyChart('balanceChart');
+      const ctx = $('balanceChart');
+      if (!ctx || !data) return;
+      const bars = data.map(d => d.balance_kcal);
+      const colors = bars.map(v => v >= 0 ? getCSS('--amber') : getCSS('--cyan'));
+      const avg = rolling(bars, 7);
+      charts.balanceChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: data.map(d => d.date.slice(5)),
+          datasets: [
+            {
+              type: 'bar', label: 'Balance',
+              data: bars, backgroundColor: colors, borderRadius: 3,
+            },
+            {
+              type: 'line', label: '7-day avg',
+              data: avg, borderColor: getCSS('--text'),
+              borderDash: [4, 4], borderWidth: 1,
+              pointRadius: 0, tension: 0.3, fill: false,
+            },
+          ],
+        },
+        options: {
+          animation: { duration: 600 },
+          plugins: { legend: { labels: { color: 'rgba(232,237,242,0.7)' } } },
+          scales: {
+            x: { ticks: { color: 'rgba(232,237,242,0.5)' }, grid: { display: false } },
+            y: { ticks: { color: 'rgba(232,237,242,0.5)' }, grid: { color: 'rgba(255,255,255,0.04)' } },
+          },
+          maintainAspectRatio: false,
         },
       });
     }
@@ -456,32 +742,6 @@ def get_today_summary(db_path: Path) -> dict:
     }
 
 
-def get_hr_24h(db_path: Path, bucket_seconds: int = 120) -> list[dict]:
-    """Return last 24h of HR averaged into `bucket_seconds`-wide buckets.
-
-    The BLE listener writes ~1Hz, so 24h ≈ 86k rows — too many to plot. Bucket
-    averaging keeps the chart responsive while preserving the shape.
-    """
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
-    bucket = max(1, bucket_seconds)
-    with db.connect(db_path) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT
-                strftime('%Y-%m-%dT%H:%M:%SZ',
-                    (CAST(strftime('%s', ts) AS INTEGER) / {bucket}) * {bucket},
-                    'unixepoch') AS bucket_ts,
-                AVG(bpm) AS avg_bpm
-            FROM hr_realtime
-            WHERE ts >= ?
-            GROUP BY bucket_ts
-            ORDER BY bucket_ts ASC
-            """,
-            (cutoff,),
-        ).fetchall()
-    return [{"t": r[0], "v": round(r[1], 1)} for r in rows]
-
-
 def get_trends(db_path: Path, days: int) -> list[dict]:
     with db.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -573,59 +833,172 @@ def _stat_card(label: str, value: str, sub: str = "", extra: str = "") -> str:
     )
 
 
-def _row1_html(summary: dict, body_battery_spark: list[dict]) -> str:
-    rhr = summary.get("resting_hr") or "—"
-    hrv = summary.get("hrv") or "—"
+def _spark_card(
+    label: str,
+    value: str,
+    sub: str,
+    canvas_id: str,
+    spark_data: list[dict],
+    category: str = "recovery",
+    countup_target: float | None = None,
+    decimals: int = 0,
+) -> str:
+    """Stat card with a 14-day sparkline behind the headline number."""
+    spark_id = canvas_id + "Data"
+    cu_attr = ""
+    inner_value = value
+    if countup_target is not None:
+        cu_attr = f' data-countup="{countup_target}" data-decimals="{decimals}"'
+        inner_value = "0"
+    return f"""
+    <div class="card relative overflow-hidden" data-cat="{category}">
+      <div class="stat-label">{label}</div>
+      <div class="stat-num mt-1"><span{cu_attr}>{inner_value}</span></div>
+      <div class="text-xs text-[color:var(--muted)] mt-1">{sub}</div>
+      <div class="sparkline-wrap">
+        <script type="application/json" id="{spark_id}">{json.dumps(spark_data)}</script>
+        <canvas id="{canvas_id}"></canvas>
+      </div>
+    </div>
+    """
+
+
+def _hero_html(readiness: dict, summary: dict) -> str:
+    """Big readiness ring + recommendation copy + three sub-stats."""
+    score = readiness.get("score")
+    band = readiness.get("band") or "unknown"
+    components = readiness.get("components") or {}
+
+    if score is None:
+        score_display = "—"
+        pct = 0.0
+        rec_label = "AWAITING DATA"
+        rec_sub = "Need ≥1 day of summary to score readiness."
+        pill_class = "pill-muted"
+    else:
+        score_display = str(score)
+        pct = score / 100.0
+        rec_label, rec_sub = {
+            "high":   ("PEAK · TRAIN HARD",  "Body's primed. Push the intensity today."),
+            "medium": ("STEADY · MAINTAIN",  "Solid recovery — train as planned."),
+            "low":    ("RED · RECOVER",      "Recovery debt. Prioritize sleep & easy work."),
+        }.get(band, ("BUILDING BASELINE", ""))
+        pill_class = {"high": "pill-lime", "medium": "pill-cyan", "low": "pill-magenta"}.get(band, "pill-muted")
+
+    def _delta_pill(comp_key: str, label: str) -> str:
+        v = components.get(comp_key)
+        if v is None:
+            return f'<div class="pill pill-muted">{label} —</div>'
+        sign = "+" if v >= 0 else ""
+        cls = "pill-lime" if v > 0.05 else ("pill-magenta" if v < -0.05 else "pill-cyan")
+        return f'<div class="pill {cls}">{label} {sign}{int(round(v * 100))}%</div>'
+
+    return f"""
+    <section class="card" data-cat="recovery">
+      <div class="flex flex-col md:flex-row md:items-center gap-6">
+        <!-- Readiness ring -->
+        <div class="relative flex items-center justify-center" style="width:240px;height:240px">
+          <svg viewBox="0 0 240 240" width="240" height="240" class="-rotate-90 glow-cyan">
+            <circle class="ring-track" cx="120" cy="120" r="100" stroke-width="14" fill="none"></circle>
+            <circle class="ring-fill-readiness" cx="120" cy="120" r="100" stroke-width="14"
+                    fill="none" stroke-linecap="round"
+                    data-ring-pct="{pct:.4f}"></circle>
+          </svg>
+          <div class="absolute inset-0 flex flex-col items-center justify-center">
+            <div class="display-num">
+              <span data-countup="{score if score is not None else 0}" data-decimals="0">0</span>
+            </div>
+            <div class="stat-label mt-1">Readiness</div>
+          </div>
+        </div>
+
+        <!-- Right side -->
+        <div class="flex-1 space-y-4">
+          <div>
+            <div class="flex items-center gap-3">
+              <div class="pill {pill_class}">{rec_label}</div>
+            </div>
+            <p class="text-sm text-[color:var(--muted)] mt-2">{rec_sub}</p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            {_delta_pill("hrv", "HRV")}
+            {_delta_pill("rhr", "RHR")}
+            {_delta_pill("sleep", "SLEEP")}
+            {_delta_pill("bb", "BODY BATT")}
+          </div>
+          <div class="text-xs mono text-[color:var(--muted)]">
+            for {summary.get('date') or _today_iso()} · weights: hrv 0.5 · rhr 0.2 · sleep 0.2 · bb 0.1
+          </div>
+        </div>
+      </div>
+    </section>
+    """
+
+
+def _stats_row_html(db_path: Path, summary: dict, trends: list[dict]) -> str:
+    """Six stat cards with 14-day sparklines."""
+    last14 = trends[-14:]
+    rhr_spark = [{"date": r["date"], "value": r["resting_hr"]} for r in last14]
+    hrv_spark = [{"date": r["date"], "value": r["hrv_overnight"]} for r in last14]
+
+    with db.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT date, steps, sleep_seconds FROM daily_summary "
+            "ORDER BY date DESC LIMIT 14"
+        ).fetchall()
+    rows = [dict(r) for r in reversed(rows)]
+    steps_spark = [{"date": r["date"], "value": r.get("steps")} for r in rows]
+    sleep_spark = [
+        {"date": r["date"], "value": (r.get("sleep_seconds") or 0) / 3600.0 if r.get("sleep_seconds") else None}
+        for r in rows
+    ]
+    bb_spark = [{"date": r["date"], "value": r["body_battery"]} for r in last14]
+
+    rhr = summary.get("resting_hr")
+    hrv = summary.get("hrv")
     steps = summary.get("steps") or 0
     bb = summary.get("body_battery")
     stress = summary.get("stress_avg")
-    sleep_label, sleep_class = _sleep_quality(summary.get("sleep_seconds"))
-
-    steps_pct = min(100, int(steps / 100)) if steps else 0
-    bar = (
-        f'<div class="mt-2 h-1.5 bg-gray-800 rounded">'
-        f'<div class="h-1.5 rounded bg-emerald-500" style="width:{steps_pct}%"></div></div>'
-    )
-
-    hrv_state = summary.get("hrv_state", "—")
-    hrv_state_color = {
-        "HIGH": "bg-emerald-900/60 text-emerald-300",
-        "BALANCED": "bg-blue-900/60 text-blue-300",
-        "LOW": "bg-red-900/60 text-red-300",
-    }.get(hrv_state, "bg-gray-700 text-gray-300")
-
-    bb_value = f"{bb}" if bb is not None else "—"
-    bb_extra = (
-        f'<div class="mt-2"><script type="application/json" id="bodyBatterySparkData">'
-        f'{json.dumps(body_battery_spark)}</script>'
-        f'<canvas id="bbSparkChart" height="40"></canvas></div>'
-    )
+    sleep_h = (summary.get("sleep_seconds") or 0) / 3600.0 if summary.get("sleep_seconds") else None
 
     return f"""
     <section class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-      {_stat_card("Resting HR", f"{rhr} <span class='text-base text-gray-400'>{summary['resting_hr_arrow']}</span>", "bpm vs yesterday")}
-      {_stat_card("HRV", f"{hrv} <span class='text-base text-gray-400'>{summary['hrv_arrow']}</span>",
-                  "ms (overnight)",
-                  f'<span class="badge mt-2 {hrv_state_color}">{hrv_state}</span>')}
-      {_stat_card("Steps", f"{steps:,}", "goal 10,000", bar)}
-      {_stat_card("Sleep", _fmt_seconds(summary.get('sleep_seconds')), "last night",
-                  f'<span class="badge mt-2 {sleep_class}">{sleep_label}</span>')}
-      {_stat_card("Body Battery", bb_value, "current", bb_extra)}
-      {_stat_card("Stress", f"{stress if stress is not None else '—'}", "avg today",
-                  f'<span class="badge mt-2 {_stress_color(stress)}">·</span>')}
+      {_spark_card("Resting HR",
+                   value="—" if rhr is None else str(rhr),
+                   sub="bpm",
+                   canvas_id="rhrSpark", spark_data=rhr_spark, category="recovery",
+                   countup_target=float(rhr) if rhr is not None else None)}
+      {_spark_card("HRV",
+                   value="—" if hrv is None else str(hrv),
+                   sub="ms · overnight",
+                   canvas_id="hrvSpark", spark_data=hrv_spark, category="recovery",
+                   countup_target=float(hrv) if hrv is not None else None)}
+      {_spark_card("Steps",
+                   value=f"{steps:,}",
+                   sub="today",
+                   canvas_id="stepsSpark", spark_data=steps_spark, category="training",
+                   countup_target=float(steps))}
+      {_spark_card("Sleep",
+                   value="—" if sleep_h is None else f"{sleep_h:.1f}h",
+                   sub="last night",
+                   canvas_id="sleepSpark", spark_data=sleep_spark, category="sleep",
+                   countup_target=sleep_h, decimals=1)}
+      {_spark_card("Body Batt",
+                   value="—" if bb is None else str(bb),
+                   sub="current",
+                   canvas_id="bbSparkChart", spark_data=bb_spark, category="recovery",
+                   countup_target=float(bb) if bb is not None else None)}
+      {_spark_card("Stress",
+                   value="—" if stress is None else str(stress),
+                   sub="avg today",
+                   canvas_id="stressSpark", spark_data=[],  # no historical stress in trends
+                   category="alerts",
+                   countup_target=float(stress) if stress is not None else None)}
     </section>
     """
 
 
-def _row2_html(hr_data: list[dict]) -> str:
-    return f"""
-    <section class="card">
-      <h2 class="font-semibold mb-2">HR — last 24h</h2>
-      <p class="text-xs text-gray-400 mb-2">Scroll to zoom · drag to pan</p>
-      <script type="application/json" id="hrRealtimeData">{json.dumps(hr_data)}</script>
-      <canvas id="hrChart"></canvas>
-    </section>
-    """
 
 
 def _row3_html(trends: list[dict]) -> str:
@@ -739,37 +1112,228 @@ def _row5_html(activities: list[dict], cal_load: list[dict]) -> str:
     """
 
 
-def _row6_html(readiness: dict, scatter: list[dict]) -> str:
-    risk_color = {
-        "green": "bg-emerald-500",
-        "yellow": "bg-amber-500",
-        "red": "bg-red-500",
-    }[readiness["illness_risk"]]
-    risk_text = {
-        "green": "Healthy — no warning signs",
-        "yellow": "Watch — one of RHR/HRV is off",
-        "red": "Elevated risk — both RHR & HRV are off",
-    }[readiness["illness_risk"]]
+def _acwr_gauge_svg(ratio: float | None, band: str | None) -> str:
+    """Hand-rolled semicircular ACWR gauge. Sweet spot 0.8–1.3, danger >1.5 or <0.8."""
+    if ratio is None:
+        needle_pct = 0.5
+        ratio_text = "—"
+        band_label = "AWAITING DATA"
+        pill_cls = "pill-muted"
+    else:
+        # Map ratio [0.0, 2.0] → [0, 1] for needle position; clamp.
+        needle_pct = max(0.0, min(1.0, ratio / 2.0))
+        ratio_text = f"{ratio:.2f}"
+        band_label = {
+            "undertrained": "UNDERTRAINED",
+            "optimal":      "OPTIMAL",
+            "caution":      "CAUTION",
+            "high_risk":    "HIGH RISK",
+        }.get(band or "", band or "—")
+        pill_cls = {
+            "undertrained": "pill-cyan",
+            "optimal":      "pill-lime",
+            "caution":      "pill-amber",
+            "high_risk":    "pill-magenta",
+        }.get(band or "", "pill-muted")
+
+    # Semicircle: 180° from left to right. Convert needle_pct → angle in [-90°, +90°].
+    angle = -90 + 180 * needle_pct
+    needle_x = 100 + 80 * (angle / 180 * 2)  # rough linear placement
+    # Better: use trig
+    import math as _m
+    rad = _m.radians(angle - 90)
+    needle_x = 100 + 80 * _m.cos(rad)
+    needle_y = 100 + 80 * _m.sin(rad)
     return f"""
-    <section class="grid md:grid-cols-3 gap-3">
-      <div class="card border-2 {readiness['color']}">
-        <div class="stat-label">Today's recommendation</div>
-        <div class="text-2xl font-bold mt-1">{readiness['label']}</div>
-        <div class="text-xs text-gray-400 mt-2">
-          HRV vs baseline: {_fmt_pct(readiness['hrv_delta'])} ·
-          RHR vs baseline: {_fmt_pct(readiness['rhr_delta'])}
+    <svg viewBox="0 0 200 110" class="w-full max-w-[280px] mx-auto">
+      <!-- band arcs (under-, optimal, caution, danger) -->
+      <path d="M 20 100 A 80 80 0 0 1 52 33" stroke="#0e8aa3" stroke-width="9" fill="none" opacity="0.8"/>
+      <path d="M 52 33 A 80 80 0 0 1 148 33" stroke="#7ec831" stroke-width="9" fill="none" opacity="0.85"/>
+      <path d="M 148 33 A 80 80 0 0 1 168 50" stroke="#cc8e00" stroke-width="9" fill="none" opacity="0.85"/>
+      <path d="M 168 50 A 80 80 0 0 1 180 100" stroke="#cc2570" stroke-width="9" fill="none" opacity="0.85"/>
+      <!-- needle -->
+      <line x1="100" y1="100" x2="{needle_x:.1f}" y2="{needle_y:.1f}"
+            stroke="#e8edf2" stroke-width="2.5" stroke-linecap="round" filter="drop-shadow(0 0 4px rgba(255,255,255,0.6))"/>
+      <circle cx="100" cy="100" r="4" fill="#e8edf2"/>
+      <!-- numeric labels -->
+      <text x="20" y="108" fill="#6a7282" font-size="8" font-family="JetBrains Mono">0.0</text>
+      <text x="100" y="108" fill="#6a7282" font-size="8" font-family="JetBrains Mono" text-anchor="middle">1.0</text>
+      <text x="180" y="108" fill="#6a7282" font-size="8" font-family="JetBrains Mono" text-anchor="end">2.0+</text>
+    </svg>
+    <div class="text-center mt-2">
+      <div class="display-num" style="font-size:2.8rem">{ratio_text}</div>
+      <div class="pill {pill_cls} mt-2">{band_label}</div>
+    </div>
+    """
+
+
+def _training_intel_html(intel: dict) -> str:
+    acwr_data = intel.get("acwr") or {}
+    monotony_data = intel.get("monotony") or {}
+    z2_data = intel.get("z2") or {}
+    sleep_debt_data = intel.get("sleep_debt") or {}
+
+    # ACWR
+    acwr_ratio = acwr_data.get("ratio")
+    acwr_band = acwr_data.get("band")
+    acute = acwr_data.get("acute_avg")
+    chronic = acwr_data.get("chronic_avg")
+    acwr_sub = (
+        f"7d avg <span class='mono text-[color:var(--text)]'>{acute:.0f}</span> kcal · "
+        f"28d avg <span class='mono text-[color:var(--text)]'>{chronic:.0f}</span> kcal"
+        if acwr_ratio is not None and acute is not None and chronic is not None
+        else "Need 28 days of activity history."
+    )
+
+    # Monotony
+    monotony = monotony_data.get("monotony")
+    monotony_band = monotony_data.get("band")
+    monotony_pill = {
+        "varied":      "pill-lime",
+        "elevated":    "pill-amber",
+        "monotonous":  "pill-magenta",
+        "rest":        "pill-muted",
+    }.get(monotony_band or "", "pill-muted")
+    monotony_value = f"{monotony:.2f}" if monotony is not None else "—"
+    monotony_label = {
+        "varied":     "VARIED",
+        "elevated":   "ELEVATED",
+        "monotonous": "MONOTONOUS",
+        "rest":       "REST WEEK",
+    }.get(monotony_band or "", "AWAITING DATA")
+    monotony_caption = (
+        "Foster index = mean ÷ std of 7-day load. > 2.0 flags overuse risk."
+    )
+
+    # Z2
+    z2_min = z2_data.get("minutes", 0)
+    z2_goal = z2_data.get("goal_minutes", 150)
+    z2_lower = z2_data.get("lower_bpm", 0)
+    z2_upper = z2_data.get("upper_bpm", 0)
+    z2_pct = min(1.0, z2_min / z2_goal) if z2_goal else 0.0
+    z2_pct_pretty = f"{int(round(z2_pct * 100))}%"
+
+    # Sleep debt
+    sd_total = sleep_debt_data.get("total_h", 0.0)
+    sd_target = sleep_debt_data.get("target_h", 8)
+    sd_status_label = "DEBT" if sd_total > 0 else ("SURPLUS" if sd_total < 0 else "BALANCED")
+    sd_pill = "pill-magenta" if sd_total > 0 else ("pill-lime" if sd_total < 0 else "pill-cyan")
+
+    return f"""
+    <section>
+      <h2 class="section-title">Training Intelligence</h2>
+      <div class="grid md:grid-cols-2 lg:grid-cols-4 gap-3">
+        <!-- ACWR gauge -->
+        <div class="card" data-cat="training">
+          <div class="stat-label">ACWR · Injury Risk</div>
+          {_acwr_gauge_svg(acwr_ratio, acwr_band)}
+          <div class="text-xs text-[color:var(--muted)] mt-3">{acwr_sub}</div>
+        </div>
+
+        <!-- Monotony -->
+        <div class="card" data-cat="training">
+          <div class="stat-label">Training Monotony</div>
+          <div class="display-num mt-3" style="font-size:4rem">{monotony_value}</div>
+          <div class="pill {monotony_pill} mt-3">{monotony_label}</div>
+          <p class="text-xs text-[color:var(--muted)] mt-3">{monotony_caption}</p>
+        </div>
+
+        <!-- Z2 minutes -->
+        <div class="card" data-cat="training">
+          <div class="stat-label">Z2 Aerobic · This Week</div>
+          <div class="flex items-baseline gap-2 mt-3">
+            <span class="display-num" style="font-size:3rem">
+              <span data-countup="{z2_min}">0</span>
+            </span>
+            <span class="text-sm text-[color:var(--muted)]">/ {z2_goal} min · {z2_pct_pretty}</span>
+          </div>
+          <div class="mt-3 h-1.5 bg-[color:var(--ink-3)] rounded">
+            <div class="h-1.5 rounded glow-lime"
+                 style="background:var(--lime); width:{z2_pct * 100:.1f}%"></div>
+          </div>
+          <div style="height:90px" class="mt-3">
+            <script type="application/json" id="z2Data">{json.dumps(z2_data)}</script>
+            <canvas id="z2Chart"></canvas>
+          </div>
+          <div class="text-[0.65rem] mono text-[color:var(--muted)] mt-1">
+            zone {z2_lower}–{z2_upper} bpm · 60–70% HRmax
+          </div>
+        </div>
+
+        <!-- Sleep debt -->
+        <div class="card" data-cat="sleep">
+          <div class="stat-label">Sleep Debt · 7d</div>
+          <div class="flex items-baseline gap-2 mt-3">
+            <span class="display-num" style="font-size:3rem">
+              <span data-countup="{sd_total}" data-decimals="1">0</span>
+            </span>
+            <span class="text-sm text-[color:var(--muted)]">h vs {sd_target}h target</span>
+          </div>
+          <div class="pill {sd_pill} mt-2">{sd_status_label}</div>
+          <div style="height:90px" class="mt-3">
+            <script type="application/json" id="sleepDebtData">{json.dumps(sleep_debt_data)}</script>
+            <canvas id="sleepDebtChart"></canvas>
+          </div>
         </div>
       </div>
-      <div class="card">
-        <h2 class="font-semibold mb-2">HRV vs RHR — last 14d</h2>
-        <script type="application/json" id="scatterData">{json.dumps(scatter)}</script>
-        <canvas id="scatterChart"></canvas>
-      </div>
-      <div class="card">
-        <h2 class="font-semibold mb-2">Illness risk</h2>
-        <div class="flex items-center gap-3 mt-3">
-          <span class="inline-block w-5 h-5 rounded-full {risk_color}"></span>
-          <span class="text-sm">{risk_text}</span>
+    </section>
+    """
+
+
+def _year_heatmap_html(history: list[dict]) -> str:
+    """52-week × 7-day grid, GitHub-contribution-graph style."""
+    # Group by ISO week from latest date back 365 days.
+    # Layout: 7 rows (weekday), 53 cols.
+    if not history:
+        return ""
+    cells = []
+    # Build a per-date map for quick lookup
+    score_by_date = {h["date"]: h.get("score") for h in history}
+
+    end = datetime.fromisoformat(history[-1]["date"]).date()
+    # Walk back to a Sunday so columns are aligned weeks
+    days_back = len(history)
+    start = end - timedelta(days=days_back - 1)
+    # Pad to start on Sunday for column alignment
+    pre_pad = (start.weekday() + 1) % 7  # Sunday=0
+    start = start - timedelta(days=pre_pad)
+    cur = start
+    cols = []
+    while cur <= end:
+        col = []
+        for _ in range(7):
+            score = score_by_date.get(cur.isoformat())
+            if score is None:
+                color = _HEATMAP_PALETTE[0]
+            else:
+                # 7 buckets above the empty one
+                bucket = min(7, max(1, round(score / 100 * 7)))
+                color = _HEATMAP_PALETTE[bucket]
+            col.append(
+                f'<div class="heatmap-cell" style="background:{color}" '
+                f'title="{cur.isoformat()} · score {score if score is not None else "—"}"></div>'
+            )
+            cur += timedelta(days=1)
+        cols.append("<div class='flex flex-col gap-[2px]'>" + "".join(col) + "</div>")
+        if cur > end:
+            break
+    legend_swatches = "".join(
+        f'<div class="heatmap-cell" style="background:{c}"></div>'
+        for c in _HEATMAP_PALETTE
+    )
+    return f"""
+    <section>
+      <h2 class="section-title">Annual Readiness · {len(history)}d</h2>
+      <div class="card" data-cat="recovery">
+        <div class="overflow-x-auto">
+          <div class="flex gap-[2px] min-w-fit">
+            {''.join(cols)}
+          </div>
+        </div>
+        <div class="flex items-center gap-2 mt-3 text-xs text-[color:var(--muted)]">
+          <span>low</span>
+          <div class="flex gap-[2px]">{legend_swatches}</div>
+          <span>high</span>
         </div>
       </div>
     </section>
@@ -785,88 +1349,262 @@ def _meal_time_local(meal_time: str | None) -> str:
         return meal_time[11:16] if len(meal_time) >= 16 else meal_time
 
 
-def _nutrition_row_html(balance: dict, meals: list[dict]) -> str:
+def _macro_ring_svg(label: str, current_g: float, target_g: float, ring_class: str) -> str:
+    pct = max(0.0, min(1.0, current_g / target_g)) if target_g else 0.0
+    return f"""
+    <div class="flex flex-col items-center">
+      <div class="relative" style="width:120px;height:120px">
+        <svg viewBox="0 0 120 120" width="120" height="120" class="-rotate-90">
+          <circle class="ring-track" cx="60" cy="60" r="50" stroke-width="9" fill="none"></circle>
+          <circle class="{ring_class}" cx="60" cy="60" r="50" stroke-width="9" fill="none"
+                  stroke-linecap="round" data-ring-pct="{pct:.4f}"></circle>
+        </svg>
+        <div class="absolute inset-0 flex flex-col items-center justify-center">
+          <div class="stat-num-sm"><span data-countup="{current_g:.0f}">0</span></div>
+          <div class="text-[0.6rem] mono text-[color:var(--muted)]">/ {target_g:.0f}g</div>
+        </div>
+      </div>
+      <div class="stat-label mt-2">{label}</div>
+    </div>
+    """
+
+
+def _gauge_bar(label: str, current: float, target: float, danger_above: bool = False) -> str:
+    pct_raw = current / target if target else 0
+    pct = max(0.0, min(1.0, pct_raw))
+    over = pct_raw > 1.0 and danger_above
+    bar_color = "var(--magenta)" if over else "var(--cyan)"
+    bar_glow = "glow-magenta" if over else "glow-cyan"
+    return f"""
+    <div>
+      <div class="flex items-baseline justify-between">
+        <span class="stat-label">{label}</span>
+        <span class="text-xs mono">
+          <span class="text-[color:var(--text)]">{current:.0f}</span>
+          <span class="text-[color:var(--muted)]">/ {target:.0f}</span>
+        </span>
+      </div>
+      <div class="h-2 mt-1 bg-[color:var(--ink-3)] rounded overflow-hidden">
+        <div class="h-2 rounded {bar_glow}" style="background:{bar_color};width:{pct*100:.1f}%"></div>
+      </div>
+    </div>
+    """
+
+
+def _meal_timing_strip(meals: list[dict], timing: dict | None) -> str:
+    """Horizontal 24h timeline with meal dots and the active fasting window highlighted."""
+    if not meals:
+        return (
+            '<div class="timing-strip flex items-center justify-center text-xs '
+            'text-[color:var(--muted)]">No meals logged · 24h timeline</div>'
+        )
+    # Convert each meal_time → fraction of day (local).
+    marks_html = []
+    for m in meals:
+        try:
+            t = datetime.fromisoformat(m["meal_time"]).astimezone()
+            frac = (t.hour * 3600 + t.minute * 60 + t.second) / 86400.0
+        except (TypeError, ValueError, KeyError):
+            continue
+        title = f'{t.strftime("%H:%M")} · {m.get("description") or ""}'
+        marks_html.append(
+            f'<div class="timing-mark" style="left:{frac*100:.2f}%" title="{title}"></div>'
+        )
+    ticks = "".join(
+        f'<div class="timing-tick" style="left:{i/24*100:.2f}%"></div>'
+        for i in range(1, 24)
+    )
+    fasting_html = ""
+    if timing:
+        fasting_html = (
+            f'<div class="text-xs mono text-[color:var(--muted)] mt-1">'
+            f'first {timing["first_meal_local"]} · last {timing["last_meal_local"]} · '
+            f'eating window {timing["eating_window_h"]:.1f}h · '
+            f'<span class="text-[color:var(--amber)]">{timing["hours_since_last_meal"]:.1f}h since last</span>'
+            f'</div>'
+        )
+    return f"""
+    <div>
+      <div class="timing-strip">
+        {ticks}
+        {''.join(marks_html)}
+      </div>
+      <div class="flex justify-between text-[0.6rem] mono text-[color:var(--muted)] mt-1">
+        <span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span>
+      </div>
+      {fasting_html}
+    </div>
+    """
+
+
+def _energy_availability_card(ea: dict) -> str:
+    status = ea.get("status")
+    ea_value = ea.get("ea_kcal_per_kg")
+    if status == "unknown" or ea_value is None:
+        return f"""
+        <div class="card" data-cat="nutrition">
+          <div class="stat-label">Energy Availability</div>
+          <div class="text-sm text-[color:var(--muted)] mt-3">
+            Log meals to compute EA (kcal/kg LBM) and the RED-S threshold.
+          </div>
+        </div>
+        """
+    label = {"optimal": "OPTIMAL", "low": "LOW", "red_s": "RED-S WARNING"}.get(status, status.upper())
+    pill = {"optimal": "pill-lime", "low": "pill-amber", "red_s": "pill-magenta"}.get(status, "pill-muted")
+    glow = {"optimal": "glow-lime", "low": "glow-amber", "red_s": "glow-magenta"}.get(status, "")
+    note = {
+        "optimal": "≥ 45 kcal/kg LBM — physiologically supportive.",
+        "low": "30–45 kcal/kg LBM — adaptation may suffer if sustained.",
+        "red_s": "< 30 kcal/kg LBM — IOC RED-S threshold. Eat more.",
+    }.get(status, "")
+    return f"""
+    <div class="card" data-cat="nutrition">
+      <div class="stat-label">Energy Availability</div>
+      <div class="display-num mt-3 {glow}" style="font-size:3.4rem">
+        <span data-countup="{ea_value}" data-decimals="1">0</span>
+        <span class="text-base text-[color:var(--muted)] ml-1">kcal/kg</span>
+      </div>
+      <div class="pill {pill} mt-2">{label}</div>
+      <p class="text-xs text-[color:var(--muted)] mt-3">{note}</p>
+      <p class="text-[0.65rem] mono text-[color:var(--muted)] mt-1">
+        LBM est. {ea.get('lbm_kg', 0):.1f}kg · activity {ea.get('activity_kcal', 0):.0f}kcal
+      </p>
+    </div>
+    """
+
+
+def _nutrition_v2_html(
+    balance: dict,
+    meals: list[dict],
+    nutrition_extras: dict,
+    history_7d: list[dict],
+) -> str:
     eaten = balance.get("eaten_kcal") or 0
     bmr = balance.get("bmr_kcal") or 0
     steps_burned = balance.get("steps_burned_kcal") or 0
     activity_burned = balance.get("burned_kcal") or 0
     total_burned = balance.get("total_burned_kcal") or 0
     bal = balance.get("balance_kcal") or 0
-    sign_label = "surplus" if bal >= 0 else "deficit"
-    sign_color = (
-        "bg-amber-900/60 text-amber-300" if bal >= 0
-        else "bg-emerald-900/60 text-emerald-300"
-    )
-    bal_text = f"{bal:+.0f} kcal {sign_label}"
+    bal_pill = "pill-amber" if bal >= 0 else "pill-cyan"
+    bal_label = f"{bal:+.0f} kcal · " + ("SURPLUS" if bal >= 0 else "DEFICIT")
 
-    activities_row = (
-        f'<div class="flex justify-between"><span>Activities:</span>'
-        f'<span class="font-mono">{activity_burned:>5} kcal</span></div>'
-        if activity_burned > 0 else ""
+    protein_g = balance.get("protein_g") or 0
+    carbs_g = balance.get("carbs_g") or 0
+    fat_g = balance.get("fat_g") or 0
+
+    p_target = nutrition_extras.get("protein_target_g") or 1
+    f_target = nutrition_extras.get("fiber_target_g") or 30
+    sodium_target = nutrition_extras.get("sodium_target_mg") or 2300
+
+    # Aggregate fiber + sodium from meals (column may be NULL).
+    fiber_total = sum((m.get("fiber_g") or 0) for m in meals)
+    sodium_total = sum((m.get("sodium_mg") or 0) for m in meals)
+
+    # Carbs target ≈ 50% of kcal target / 4 ; fat target ≈ 25% / 9. Rough but useful.
+    kcal_target = nutrition_extras.get("kcal_target") or 2200
+    c_target = max(1, int(kcal_target * 0.50 / 4))
+    f_g_target = max(1, int(kcal_target * 0.25 / 9))
+
+    whole_pct = nutrition_extras.get("whole_food_pct")
+    whole_pill_html = (
+        f'<span class="pill pill-lime">{int(round(whole_pct * 100))}% WHOLE FOOD</span>'
+        if whole_pct is not None and whole_pct >= 0.7
+        else f'<span class="pill pill-amber">{int(round(whole_pct * 100))}% WHOLE FOOD</span>'
+        if whole_pct is not None
+        else ""
     )
 
-    meals_block: str
+    timing = nutrition_extras.get("meal_timing")
+    timing_strip = _meal_timing_strip(meals, timing)
+
+    # Meals table
     if not meals:
-        meals_block = '<p class="text-gray-500 text-sm">No meals logged today.</p>'
+        meals_block = '<p class="text-[color:var(--muted)] text-sm">No meals logged today.</p>'
     else:
         items = []
         for m in meals:
             t = _meal_time_local(m.get("meal_time"))
             kcal = m.get("kcal")
-            kcal_str = f"{kcal:.0f} kcal" if kcal is not None else "— kcal"
+            kcal_str = f"{kcal:.0f}" if kcal is not None else "—"
+            cat = m.get("food_category") or ""
             items.append(
-                "<tr class='border-t border-gray-800'>"
-                f"<td class='py-1 pr-3 text-gray-400 w-16'>{t}</td>"
-                f"<td class='py-1 pr-3'>{m.get('description') or '—'}</td>"
-                f"<td class='py-1 pr-3 text-right text-gray-300 whitespace-nowrap'>{kcal_str}</td>"
-                "</tr>"
+                f"<tr class='border-t border-[color:var(--line)]'>"
+                f"<td class='py-1.5 pr-3 mono text-[color:var(--muted)] w-16'>{t}</td>"
+                f"<td class='py-1.5 pr-3'>{m.get('description') or '—'}"
+                f"<div class='text-[0.65rem] text-[color:var(--muted)]'>{cat}</div></td>"
+                f"<td class='py-1.5 pr-3 mono text-right text-[color:var(--text)]'>{kcal_str}</td>"
+                f"</tr>"
             )
         meals_block = (
             "<table class='w-full text-sm'>"
-            "<thead><tr class='text-gray-400 text-xs uppercase'>"
-            "<th class='text-left pr-3'>Time</th>"
-            "<th class='text-left pr-3'>Meal</th>"
-            "<th class='text-right pr-3'>kcal</th>"
-            f"</tr></thead><tbody>{''.join(items)}</tbody></table>"
+            "<thead><tr class='stat-label text-left'>"
+            "<th class='pb-2 pr-3'>Time</th><th class='pb-2 pr-3'>Meal</th>"
+            "<th class='pb-2 pr-3 text-right'>kcal</th></tr></thead>"
+            f"<tbody>{''.join(items)}</tbody></table>"
         )
 
-    macros_payload = {
-        "protein_g": balance.get("protein_g") or 0,
-        "carbs_g": balance.get("carbs_g") or 0,
-        "fat_g": balance.get("fat_g") or 0,
-    }
-    macros_total = sum(macros_payload.values())
-    macros_block = (
-        f'<script type="application/json" id="macrosData">{json.dumps(macros_payload)}</script>'
-        f'<canvas id="macrosChart"></canvas>'
-        if macros_total > 0
-        else '<p class="text-gray-500 text-sm">No macros logged yet.</p>'
-    )
-
     return f"""
-    <section class="space-y-3">
-      <h2 class="font-semibold text-lg">🍽️ Nutrition — Today</h2>
+    <section>
+      <h2 class="section-title">Nutrition · Today</h2>
+
+      <!-- Top row: balance summary + macros -->
       <div class="grid md:grid-cols-3 gap-3">
-        <div class="card">
-          <div class="stat-label">🍽️ Calorie balance</div>
-          <div class="stat-num">{eaten:.0f} <span class="text-base text-gray-400">kcal in</span></div>
-          <div class="mt-3 text-xs text-gray-300 space-y-0.5">
-            <div class="text-gray-400 uppercase tracking-wide text-[0.65rem]">Burned</div>
-            <div class="flex justify-between"><span>BMR:</span><span class="font-mono">{bmr:>5} kcal</span></div>
-            <div class="flex justify-between"><span>Steps:</span><span class="font-mono">{steps_burned:>5} kcal</span></div>
-            {activities_row}
-            <div class="border-t border-gray-700 my-1"></div>
-            <div class="flex justify-between font-semibold"><span>Total:</span><span class="font-mono">{total_burned:>5} kcal</span></div>
+        <div class="card" data-cat="nutrition">
+          <div class="stat-label">Calorie Balance</div>
+          <div class="display-num mt-3" style="font-size:3.6rem">
+            <span data-countup="{eaten:.0f}">0</span>
+            <span class="text-base text-[color:var(--muted)] ml-1">kcal in</span>
           </div>
-          <span class="badge mt-3 {sign_color}">{bal_text}</span>
+          <div class="pill {bal_pill} mt-2">{bal_label}</div>
+          <div class="mt-4 text-xs text-[color:var(--text)] space-y-1">
+            <div class="stat-label" style="letter-spacing:0.1em">Burned</div>
+            <div class="flex justify-between mono"><span class="text-[color:var(--muted)]">BMR</span><span>{bmr} kcal</span></div>
+            <div class="flex justify-between mono"><span class="text-[color:var(--muted)]">Steps</span><span>{steps_burned} kcal</span></div>
+            {f"<div class='flex justify-between mono'><span class='text-[color:var(--muted)]'>Activities</span><span>{activity_burned} kcal</span></div>" if activity_burned > 0 else ""}
+            <div class="flex justify-between font-semibold mt-1 pt-1 border-t border-[color:var(--line)] mono">
+              <span>Total</span><span>{total_burned} kcal</span>
+            </div>
+          </div>
+          {('<div class="mt-3">' + whole_pill_html + '</div>') if whole_pill_html else ""}
         </div>
-        <div class="card">
-          <h3 class="font-semibold mb-2 text-sm">Macros</h3>
-          {macros_block}
+
+        <div class="card md:col-span-2" data-cat="nutrition">
+          <div class="stat-label">Macros · Today</div>
+          <div class="grid grid-cols-3 gap-2 mt-4">
+            {_macro_ring_svg("Protein", protein_g, p_target, "ring-fill-p")}
+            {_macro_ring_svg("Carbs",   carbs_g,   c_target, "ring-fill-c")}
+            {_macro_ring_svg("Fat",     fat_g,     f_g_target, "ring-fill-f")}
+          </div>
+          <div class="mt-5 space-y-3">
+            {_gauge_bar("Fiber", fiber_total, f_target)}
+            {_gauge_bar("Sodium · mg", sodium_total, sodium_target, danger_above=True)}
+          </div>
         </div>
-        <div class="card overflow-x-auto">
-          <h3 class="font-semibold mb-2 text-sm">Meals</h3>
-          {meals_block}
+      </div>
+
+      <!-- Middle row: EA + meal timing strip -->
+      <div class="grid md:grid-cols-2 gap-3 mt-3">
+        {_energy_availability_card(nutrition_extras.get("energy_availability") or {})}
+        <div class="card" data-cat="nutrition">
+          <div class="stat-label">Meal Timing · 24h</div>
+          <div class="mt-3">
+            {timing_strip}
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom row: 7-day balance chart + meals table -->
+      <div class="grid md:grid-cols-2 gap-3 mt-3">
+        <div class="card" data-cat="nutrition">
+          <div class="stat-label">Calorie Balance · 7 Days</div>
+          <div style="height:180px" class="mt-3">
+            <script type="application/json" id="balanceData">{json.dumps(history_7d)}</script>
+            <canvas id="balanceChart"></canvas>
+          </div>
+        </div>
+        <div class="card overflow-x-auto" data-cat="nutrition">
+          <div class="stat-label">Meals</div>
+          <div class="mt-3">{meals_block}</div>
         </div>
       </div>
     </section>
@@ -901,19 +1639,18 @@ def _row7_html(alerts_list: list[dict]) -> str:
 
 
 def render_full(cfg: Config) -> str:
+    today_iso = _today_iso()
     summary = get_today_summary(cfg.db_path)
-    hr = get_hr_24h(cfg.db_path)
     trends = get_trends(cfg.db_path, 30)
     sleep_dur = [
         {"date": r["date"], "hours": round((r["sleep_seconds"] or 0) / 3600, 2)}
         for r in trends[-14:]
     ]
-    today_row = db.daily_summary_for(cfg.db_path, _today_iso()) or {}
+    today_row = db.daily_summary_for(cfg.db_path, today_iso) or {}
     yest_row = db.daily_summary_for(cfg.db_path, _yesterday_iso()) or {}
     stages = _sleep_stages_from_raw(today_row.get("raw_json")) or _sleep_stages_from_raw(
         yest_row.get("raw_json")
     )
-    bb_spark = [{"date": r["date"], "value": r["body_battery"]} for r in trends[-14:]]
 
     activities = get_activities(cfg.db_path, 14)
     cal_load = []
@@ -926,27 +1663,40 @@ def render_full(cfg: Config) -> str:
     for r in trends:
         cal_load.append({"date": r["date"], "calories": by_date.get(r["date"], 0)})
 
-    readiness = get_readiness(cfg.db_path)
-    scatter = [
-        {"hrv": r["hrv_overnight"], "rhr": r["resting_hr"]}
-        for r in trends[-14:]
-        if r["hrv_overnight"] is not None and r["resting_hr"] is not None
-    ]
-    alerts_list = get_alerts(cfg.db_path, 10)
+    readiness_v2 = db.composite_readiness(cfg.db_path, today_iso, cfg)
+    intel = {
+        "acwr": db.acwr(cfg.db_path, today_iso),
+        "monotony": db.training_monotony(cfg.db_path, today_iso),
+        "z2": db.z2_minutes_for_week(cfg.db_path, today_iso, cfg),
+        "sleep_debt": db.sleep_debt(cfg.db_path, today_iso, cfg),
+    }
+    heatmap = db.daily_readiness_history(cfg.db_path, days=180, cfg=cfg)
 
-    today_iso = _today_iso()
     today_meals = db.meals_for_date(cfg.db_path, today_iso)
     today_balance = db.calorie_balance_for_date(cfg.db_path, today_iso, cfg=cfg)
+    nutrition_extras = {
+        "protein_target_g": db.protein_target_g(cfg),
+        "fiber_target_g": db.fiber_target_g(cfg),
+        "sodium_target_mg": db.sodium_target_mg(),
+        "kcal_target": cfg.kcal_target,
+        "energy_availability": db.energy_availability(cfg.db_path, today_iso, cfg),
+        "whole_food_pct": db.whole_food_pct(cfg.db_path, today_iso),
+        "meal_timing": db.meal_timing_summary(cfg.db_path, today_iso),
+    }
+    history_7d = db.recent_calorie_balance(cfg.db_path, days=7, cfg=cfg)
+
+    alerts_list = get_alerts(cfg.db_path, 10)
 
     return "\n".join(
         [
-            _row1_html(summary, bb_spark),
-            _row2_html(hr),
+            _hero_html(readiness_v2, summary),
+            _stats_row_html(cfg.db_path, summary, trends),
+            _training_intel_html(intel),
             _row3_html(trends),
             _row4_html(stages, sleep_dur),
             _row5_html(activities, cal_load),
-            _row6_html(readiness, scatter),
-            _nutrition_row_html(today_balance, today_meals),
+            _nutrition_v2_html(today_balance, today_meals, nutrition_extras, history_7d),
+            _year_heatmap_html(heatmap),
             _row7_html(alerts_list),
         ]
     )
@@ -970,10 +1720,6 @@ def create_app(cfg: Config) -> "FastAPI":
     @app.get("/api/summary")
     def api_summary() -> JSONResponse:
         return JSONResponse(get_today_summary(cfg.db_path))
-
-    @app.get("/api/hr-realtime")
-    def api_hr() -> JSONResponse:
-        return JSONResponse(get_hr_24h(cfg.db_path))
 
     @app.get("/api/trends")
     def api_trends(days: int = 30) -> JSONResponse:
@@ -1000,6 +1746,44 @@ def create_app(cfg: Config) -> "FastAPI":
     def api_calorie_balance(date: str | None = None) -> JSONResponse:
         target = date or _today_iso()
         return JSONResponse(db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg))
+
+    # ── Phase 4a: novel-metrics endpoints (consumed by the redesigned UI) ──
+
+    @app.get("/api/readiness-v2")
+    def api_readiness_v2(date: str | None = None) -> JSONResponse:
+        target = date or _today_iso()
+        return JSONResponse(db.composite_readiness(cfg.db_path, target, cfg))
+
+    @app.get("/api/training-intel")
+    def api_training_intel(date: str | None = None) -> JSONResponse:
+        target = date or _today_iso()
+        return JSONResponse({
+            "acwr": db.acwr(cfg.db_path, target),
+            "monotony": db.training_monotony(cfg.db_path, target),
+            "z2": db.z2_minutes_for_week(cfg.db_path, target, cfg),
+            "sleep_debt": db.sleep_debt(cfg.db_path, target, cfg),
+        })
+
+    @app.get("/api/heatmap")
+    def api_heatmap(days: int = 365) -> JSONResponse:
+        return JSONResponse(db.daily_readiness_history(cfg.db_path, days, cfg))
+
+    @app.get("/api/nutrition-v2")
+    def api_nutrition_v2(date: str | None = None) -> JSONResponse:
+        target = date or _today_iso()
+        balance = db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg)
+        meals = db.meals_for_date(cfg.db_path, target)
+        return JSONResponse({
+            "balance": balance,
+            "meals": meals,
+            "protein_target_g": db.protein_target_g(cfg),
+            "fiber_target_g": db.fiber_target_g(cfg),
+            "sodium_target_mg": db.sodium_target_mg(),
+            "energy_availability": db.energy_availability(cfg.db_path, target, cfg),
+            "whole_food_pct": db.whole_food_pct(cfg.db_path, target),
+            "meal_timing": db.meal_timing_summary(cfg.db_path, target),
+            "history_7d": db.recent_calorie_balance(cfg.db_path, 7, cfg),
+        })
 
     return app
 

@@ -1,23 +1,8 @@
 # garmin-monitor
 
-Personal Garmin health platform for Raspberry Pi 5. Combines two data sources into one local SQLite database:
+Personal Garmin health platform for Raspberry Pi 5. The Garmin Connect poller pulls daily summary metrics (HR, steps, sleep, stress, HRV, activities), nutrition is logged via barcode + manual entry, smart alerts trigger over Telegram, and a FastAPI dashboard renders everything with a few metrics Garmin doesn't surface raw (composite readiness, ACWR, Z2 minutes, training monotony, sleep debt).
 
-1. **BLE listener** — Real-time heart rate from your Garmin watch's BLE broadcast (~1 Hz, sub-second latency)
-2. **Garmin Connect poller** — Periodic pulls of daily summary metrics (steps, sleep, stress, HRV, etc.)
-
-Both services push notifications to **Telegram** when configurable thresholds are crossed.
-
-## Why two paths?
-
-| Aspect | BLE listener | Connect poller |
-|---|---|---|
-| Latency | ~1 second | 5–15 minutes |
-| Range | ~10 m | Anywhere |
-| Data | HR + RR intervals | Everything Garmin computes |
-| Reliable | While watch is broadcasting | Yes |
-| Official | Standard BLE HRP | Unofficial scraping |
-
-Run both. BLE during workouts and acute monitoring, poller for trend analysis.
+Storage is one local SQLite DB. No cloud, no third party between the Pi and Garmin Connect except `python-garminconnect`.
 
 ## Quick start (Raspberry Pi 5, Pi OS Bookworm)
 
@@ -26,10 +11,10 @@ git clone <your-repo-url> garmin-monitor
 cd garmin-monitor
 bash scripts/setup.sh
 cp .env.example .env
-# edit .env with your Garmin credentials, Telegram bot token, chat id
+# edit .env with your Garmin credentials, Telegram bot token, chat id, biometrics
 .venv/bin/python -m src.cli init-db
-.venv/bin/python -m src.cli poll  # one-shot test
-.venv/bin/python -m src.cli ble   # live HR listener
+.venv/bin/python auth_setup.py     # cache Garmin tokens once (handles MFA)
+.venv/bin/python -m src.cli poll   # first poll
 ```
 
 ## Telegram bot setup
@@ -39,56 +24,39 @@ cp .env.example .env
 3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy your `chat.id`
 4. Drop both into `.env`
 
-## Garmin watch setup (BLE)
-
-Enable broadcast mode on the watch — exact path depends on the model. Common ones:
-
-- **Forerunner / Fenix / Epix:** Hold UP → Settings → Sensors & Accessories → Wrist HR → Broadcast
-- **Venu / Vivoactive:** Settings → Heart Rate → Broadcast HR
-- **Older models:** Hold the light/menu button → Broadcast HR
-
-The watch must stay within ~10 m of the Pi while broadcasting. Note that on most models the watch can't simultaneously record an activity.
-
 ## Run as a service (auto-start on boot)
 
 ```bash
 sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now garmin-poller.timer
-sudo systemctl enable --now garmin-ble.service   # optional, only if always near the Pi
+sudo systemctl enable --now garmin-poller.timer    # poll every 15 min
+sudo systemctl enable --now garmin-digest.timer    # daily 08:00 Telegram digest
+sudo systemctl enable --now garmin-prune.timer     # weekly cleanup
 ```
 
 ## Architecture
 
 ```
-┌─────────────┐  BLE HRP    ┌──────────────────┐
-│ Garmin Watch│────────────►│  ble_listener.py │──┐
-└─────────────┘             └──────────────────┘  │
-                                                  ▼
-┌─────────────┐  HTTPS      ┌──────────────────┐ ┌──────────┐  ┌──────────┐
-│Garmin Connect│◄───────────│ garmin_poller.py │►│ db.py    │►│alerts.py │──► Telegram
-└─────────────┘             └──────────────────┘ │ SQLite   │  └──────────┘
-                                                 └──────────┘
+┌──────────────┐  HTTPS    ┌──────────────────┐   ┌──────────┐   ┌──────────┐
+│Garmin Connect│◄──────────│ garmin_poller.py │──►│ db.py    │──►│alerts.py │──► Telegram
+└──────────────┘           └──────────────────┘   │ SQLite   │   └──────────┘
+                                                  └──────┬───┘
+                                                         │
+                          Open Food Facts ──► food.py ──►┤
+                                                         ▼
+                                                  ┌──────────────┐
+                                                  │ dashboard.py │ ──► browser
+                                                  └──────────────┘
 ```
 
 ## Storage & retention
 
-The BLE listener writes ~2 rows/sec to `hr_realtime` while the watch is broadcasting (~100 bytes/row including indexes). HRV samples are far smaller and infrequent. A 90-day rolling window therefore caps the on-disk DB at a few hundred MB even with continuous broadcast — well within Pi-class storage.
+`activities` and `meals` are pruned after 90 days; `daily_summary` and `alerts` are kept forever (one row per day each, negligible size).
 
-`daily_summary` and `alerts` are kept forever (one row per day each, negligible size).
-
-A weekly cron-style timer prunes anything older than the retention window and runs `VACUUM` to reclaim space:
+A weekly cron-style timer runs `prune_old_data` and `VACUUM`:
 
 ```bash
-sudo cp systemd/garmin-prune.service systemd/garmin-prune.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now garmin-prune.timer
-```
-
-You can also run it manually, with a custom window:
-
-```bash
-.venv/bin/python -m src.cli prune --days 60
+.venv/bin/python -m src.cli prune --days 60   # custom window
 ```
 
 ## What's done vs what's next

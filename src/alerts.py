@@ -29,9 +29,6 @@ def send_telegram(cfg: Config, text: str) -> bool:
         return False
 
 
-_send_telegram = send_telegram  # back-compat alias
-
-
 def maybe_alert(
     cfg: Config,
     kind: str,

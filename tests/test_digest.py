@@ -17,11 +17,18 @@ def _make_cfg(db_path: Path) -> Config:
         telegram_bot_token="x",
         telegram_chat_id="x",
         db_path=db_path,
-        hr_high_bpm=160,
         hr_resting_high_bpm=85,
         alert_cooldown_seconds=0,
         poll_interval_minutes=15,
         log_level="INFO",
+        user_age=30,
+        user_height_cm=175,
+        user_weight_kg=75,
+        user_sex="male",
+        protein_target_g_per_kg=1.6,
+        kcal_target=2200,
+        sleep_target_hours=8,
+        user_hrmax=0,
     )
 
 

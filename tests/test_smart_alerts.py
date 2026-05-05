@@ -1,7 +1,5 @@
-"""Tests for the higher-level alert checks (trend, HRV drop, night-HR)."""
-import sqlite3
+"""Tests for the higher-level alert checks (trend, HRV drop)."""
 import tempfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,11 +17,18 @@ def _make_cfg(db_path: Path) -> Config:
         telegram_bot_token="x",
         telegram_chat_id="x",
         db_path=db_path,
-        hr_high_bpm=160,
         hr_resting_high_bpm=85,
         alert_cooldown_seconds=0,  # disabled for tests
         poll_interval_minutes=15,
         log_level="INFO",
+        user_age=30,
+        user_height_cm=175,
+        user_weight_kg=75,
+        user_sex="male",
+        protein_target_g_per_kg=1.6,
+        kcal_target=2200,
+        sleep_target_hours=8,
+        user_hrmax=0,
     )
 
 
@@ -99,28 +104,3 @@ def test_hrv_drop_skips_with_insufficient_history(tmpdb):
     assert not mock.called
 
 
-def test_hr_resting_alert_triggers_on_high_night_avg(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    # Insert HR samples in last night's rest window.
-    now_local = datetime.now().astimezone()
-    start_utc, end_utc = smart_alerts._last_rest_window_utc(now_local)
-    midpoint = start_utc + (end_utc - start_utc) / 2
-
-    with sqlite3.connect(tmpdb) as conn:
-        for i in range(15):
-            ts = (midpoint + timedelta(minutes=i)).isoformat(timespec="seconds")
-            conn.execute(
-                "INSERT INTO hr_realtime (ts, bpm) VALUES (?, ?)", (ts, 95)
-            )
-
-    with patch("src.smart_alerts.alerts.maybe_alert", return_value=True) as mock:
-        sent = smart_alerts.check_hr_while_resting(cfg, now=now_local)
-    assert sent is True
-    assert mock.call_args.kwargs["kind"] == "hr_resting_window"
-
-
-def test_hr_resting_alert_skips_with_no_samples(tmpdb):
-    cfg = _make_cfg(tmpdb)
-    with patch("src.smart_alerts.alerts.maybe_alert") as mock:
-        assert smart_alerts.check_hr_while_resting(cfg) is False
-    assert not mock.called

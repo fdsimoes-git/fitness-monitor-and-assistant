@@ -11,14 +11,6 @@ from typing import Iterator
 log = logging.getLogger(__name__)
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS hr_realtime (
-    ts          TEXT NOT NULL,         -- ISO8601 UTC
-    bpm         INTEGER NOT NULL,
-    rr_ms       TEXT,                  -- comma-separated RR intervals in ms (optional)
-    source      TEXT NOT NULL DEFAULT 'ble'
-);
-CREATE INDEX IF NOT EXISTS idx_hr_ts ON hr_realtime(ts);
-
 CREATE TABLE IF NOT EXISTS daily_summary (
     date            TEXT PRIMARY KEY,  -- YYYY-MM-DD
     resting_hr      INTEGER,
@@ -43,14 +35,6 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 CREATE INDEX IF NOT EXISTS idx_alerts_kind ON alerts(kind);
-
-CREATE TABLE IF NOT EXISTS hrv (
-    ts          TEXT NOT NULL,         -- ISO8601 UTC, end of the window
-    rmssd_ms    REAL NOT NULL,
-    rr_count    INTEGER NOT NULL,
-    source      TEXT NOT NULL DEFAULT 'ble'
-);
-CREATE INDEX IF NOT EXISTS idx_hrv_ts ON hrv(ts);
 
 CREATE TABLE IF NOT EXISTS activities (
     activity_id     TEXT PRIMARY KEY, -- Garmin activity ID
@@ -78,6 +62,11 @@ CREATE TABLE IF NOT EXISTS meals (
     protein_g       REAL,
     carbs_g         REAL,
     fat_g           REAL,
+    fiber_g         REAL,
+    sugars_g        REAL,
+    saturated_fat_g REAL,
+    sodium_mg       REAL,
+    food_category   TEXT,             -- coarse category from OFF pnns_groups_2
     raw_json        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_meals_meal_time ON meals(meal_time);
@@ -110,24 +99,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE alerts ADD COLUMN message TEXT")
         log.info("Migrated: added alerts.message column")
 
-
-def insert_hr(db_path: Path, bpm: int, rr_ms: list[int] | None = None) -> None:
-    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    rr_str = ",".join(str(r) for r in rr_ms) if rr_ms else None
-    with connect(db_path) as conn:
-        conn.execute(
-            "INSERT INTO hr_realtime (ts, bpm, rr_ms) VALUES (?, ?, ?)",
-            (ts, bpm, rr_str),
-        )
-
-
-def insert_hrv(db_path: Path, rmssd_ms: float, rr_count: int, source: str = "ble") -> None:
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with connect(db_path) as conn:
-        conn.execute(
-            "INSERT INTO hrv (ts, rmssd_ms, rr_count, source) VALUES (?, ?, ?, ?)",
-            (ts, float(rmssd_ms), int(rr_count), source),
-        )
+    meal_cols = {r[1] for r in conn.execute("PRAGMA table_info(meals)").fetchall()}
+    for col, decl in (
+        ("fiber_g", "REAL"),
+        ("sugars_g", "REAL"),
+        ("saturated_fat_g", "REAL"),
+        ("sodium_mg", "REAL"),
+        ("food_category", "TEXT"),
+    ):
+        if col not in meal_cols:
+            conn.execute(f"ALTER TABLE meals ADD COLUMN {col} {decl}")
+            log.info("Migrated: added meals.%s column", col)
 
 
 def upsert_daily_summary(db_path: Path, date: str, fields: dict) -> None:
@@ -221,6 +203,11 @@ def insert_meal(db_path: Path, meal: dict) -> int:
         "protein_g": meal.get("protein_g"),
         "carbs_g": meal.get("carbs_g"),
         "fat_g": meal.get("fat_g"),
+        "fiber_g": meal.get("fiber_g"),
+        "sugars_g": meal.get("sugars_g"),
+        "saturated_fat_g": meal.get("saturated_fat_g"),
+        "sodium_mg": meal.get("sodium_mg"),
+        "food_category": meal.get("food_category"),
         "raw_json": meal.get("raw_json"),
     }
     columns_sql = ", ".join(values.keys())
@@ -381,20 +368,8 @@ def recent_daily_metrics(db_path: Path, days: int) -> list[dict]:
     return [dict(r) for r in reversed(rows)]
 
 
-def avg_hr_between(db_path: Path, start_iso: str, end_iso: str) -> tuple[float, int] | None:
-    """(avg_bpm, sample_count) from hr_realtime within an ISO UTC window. None if no rows."""
-    with connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT AVG(bpm), COUNT(*) FROM hr_realtime WHERE ts >= ? AND ts < ?",
-            (start_iso, end_iso),
-        ).fetchone()
-    if not row or not row[1]:
-        return None
-    return (float(row[0]), int(row[1]))
-
-
 def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
-    """Delete rows older than `days` from hr_realtime, hrv, activities; then VACUUM.
+    """Delete rows older than `days` from activities and meals; then VACUUM.
 
     daily_summary and alerts are kept forever (one row per day, tiny).
     Returns a dict of table_name -> rows deleted.
@@ -402,9 +377,6 @@ def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
     cutoff_date = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
     deleted: dict[str, int] = {}
-    for table in ("hr_realtime", "hrv"):
-        cur = con.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff_ts,))
-        deleted[table] = cur.rowcount or 0
     cur = con.execute("DELETE FROM activities WHERE date < ?", (cutoff_date,))
     deleted["activities"] = cur.rowcount or 0
     cur = con.execute("DELETE FROM meals WHERE meal_time < ?", (cutoff_ts,))
@@ -412,11 +384,139 @@ def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
     con.execute("VACUUM")
     log.info(
         "Pruned rows older than %s (cutoff_ts=%s cutoff_date=%s): "
-        "hr_realtime=%d hrv=%d activities=%d meals=%d",
+        "activities=%d meals=%d",
         f"{days}d", cutoff_ts, cutoff_date,
-        deleted["hr_realtime"], deleted["hrv"], deleted["activities"], deleted["meals"],
+        deleted["activities"], deleted["meals"],
     )
     return deleted
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Nutrition compute helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Categories OFF labels as low-quality / discretionary calories. Anything not in
+# this set counts toward "% calories from whole foods".
+_DISCRETIONARY_CATEGORIES = {
+    "sugary snacks",
+    "salty snacks",
+    "sweetened beverages",
+    "alcoholic beverages",
+    "fats and sauces",
+    "processed meat",
+}
+
+
+def protein_target_g(cfg) -> float:
+    """Daily protein target in grams: weight_kg × cfg.protein_target_g_per_kg."""
+    return float(cfg.user_weight_kg) * float(cfg.protein_target_g_per_kg)
+
+
+def fiber_target_g(cfg) -> float:
+    """Daily fiber target: 14 g per 1000 kcal of daily target (Institute of Medicine)."""
+    return 14.0 * (float(cfg.kcal_target) / 1000.0)
+
+
+def sodium_target_mg(cfg=None) -> int:
+    """WHO upper limit for healthy adults: 2300 mg/day. cfg unused, kept for API parity."""
+    return 2300
+
+
+def energy_availability(db_path: Path, date_iso: str, cfg) -> dict:
+    """RED-S energy availability: (eaten − activity_kcal) / lean_body_mass_kg.
+
+    Returns {ea_kcal_per_kg, eaten_kcal, activity_kcal, lbm_kg, status}.
+    `status`: 'optimal' (>= 45), 'low' (30–45), 'red_s' (< 30 — IOC 2018).
+    Returns status='unknown' if no meals were logged that day.
+    """
+    bal = calorie_balance_for_date(db_path, date_iso, cfg=cfg)
+    eaten = float(bal["eaten_kcal"])
+    activity_kcal = float(bal["burned_kcal"])  # activity-only burn
+    lbm_kg = float(cfg.user_weight_kg) * 0.85  # rough estimate; could refine with body-fat input
+
+    if bal["meal_count"] == 0 or lbm_kg <= 0:
+        return {
+            "ea_kcal_per_kg": None,
+            "eaten_kcal": eaten,
+            "activity_kcal": activity_kcal,
+            "lbm_kg": lbm_kg,
+            "status": "unknown",
+        }
+    ea = (eaten - activity_kcal) / lbm_kg
+    if ea < 30:
+        status = "red_s"
+    elif ea < 45:
+        status = "low"
+    else:
+        status = "optimal"
+    return {
+        "ea_kcal_per_kg": round(ea, 1),
+        "eaten_kcal": eaten,
+        "activity_kcal": activity_kcal,
+        "lbm_kg": round(lbm_kg, 1),
+        "status": status,
+    }
+
+
+def whole_food_pct(db_path: Path, date_iso: str) -> float | None:
+    """Fraction of eaten kcal from non-discretionary categories. None if no meals.
+
+    Meals with no `food_category` are counted as whole-food (manual entries are
+    typically real meals, not packaged junk). To penalize unknown sources,
+    require categories.
+    """
+    meals = meals_for_date(db_path, date_iso)
+    total = sum(m["kcal"] for m in meals if m.get("kcal") is not None)
+    if not total:
+        return None
+    discretionary = sum(
+        m["kcal"]
+        for m in meals
+        if m.get("kcal") is not None
+        and (m.get("food_category") or "").strip().lower() in _DISCRETIONARY_CATEGORIES
+    )
+    return round((total - discretionary) / total, 3)
+
+
+def meal_timing_summary(db_path: Path, date_iso: str) -> dict | None:
+    """First/last meal of the day and the gap from last meal to now.
+
+    Returns None if no meals on `date_iso`.
+    """
+    meals = meals_for_date(db_path, date_iso)
+    if not meals:
+        return None
+    first_iso = meals[0]["meal_time"]
+    last_iso = meals[-1]["meal_time"]
+    first_dt = datetime.fromisoformat(first_iso).astimezone()
+    last_dt = datetime.fromisoformat(last_iso).astimezone()
+    eating_window_h = round((last_dt - first_dt).total_seconds() / 3600.0, 2)
+    fasting_h_since_last = round(
+        (datetime.now(timezone.utc) - datetime.fromisoformat(last_iso)).total_seconds() / 3600.0,
+        2,
+    )
+    return {
+        "first_meal_local": first_dt.strftime("%H:%M"),
+        "last_meal_local": last_dt.strftime("%H:%M"),
+        "eating_window_h": eating_window_h,
+        "hours_since_last_meal": fasting_h_since_last,
+        "meal_count": len(meals),
+    }
+
+
+def recent_calorie_balance(db_path: Path, days: int, cfg) -> list[dict]:
+    """[{date, balance_kcal}] for the last `days` calendar days, oldest first.
+
+    Pulls the per-day balance via `calorie_balance_for_date` so the math stays
+    consistent with the CLI / dashboard output.
+    """
+    today = datetime.now(timezone.utc).date()
+    out: list[dict] = []
+    for offset in range(days - 1, -1, -1):
+        d = (today - timedelta(days=offset)).isoformat()
+        bal = calorie_balance_for_date(db_path, d, cfg=cfg)
+        out.append({"date": d, "balance_kcal": bal["balance_kcal"]})
+    return out
 
 
 def daily_summary_for(db_path: Path, date_iso: str) -> dict | None:
@@ -426,3 +526,248 @@ def daily_summary_for(db_path: Path, date_iso: str) -> dict | None:
             "SELECT * FROM daily_summary WHERE date = ?", (date_iso,)
         ).fetchone()
     return dict(row) if row else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Training-intelligence metrics
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Composite-readiness component weights (must sum to 1.0).
+_READINESS_WEIGHTS = {"hrv": 0.50, "rhr": 0.20, "sleep": 0.20, "bb": 0.10}
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _hrmax(cfg) -> int:
+    return cfg.user_hrmax if cfg.user_hrmax > 0 else (220 - cfg.user_age)
+
+
+def _last_n_summaries(db_path: Path, end_date_iso: str, days: int) -> list[dict]:
+    """Last `days` daily_summary rows ending on `end_date_iso` (inclusive), oldest first."""
+    end = date.fromisoformat(end_date_iso)
+    start = (end - timedelta(days=days - 1)).isoformat()
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM daily_summary WHERE date >= ? AND date <= ? ORDER BY date ASC",
+            (start, end_date_iso),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def composite_readiness(db_path: Path, date_iso: str, cfg) -> dict:
+    """0–100 readiness score blending HRV, RHR, sleep, body battery.
+
+    Each component is normalized to [-1, +1] vs its 7-day baseline (or vs target
+    for sleep) and weighted per `_READINESS_WEIGHTS`. Missing components have
+    their weight redistributed across the survivors so the score still spans
+    [0, 100]. Returns {score, band, components} where band is 'high'/'medium'/'low'.
+
+    Returns score=None if no usable components are available for `date_iso`.
+    """
+    today = daily_summary_for(db_path, date_iso) or {}
+    baseline = _last_n_summaries(
+        db_path,
+        (date.fromisoformat(date_iso) - timedelta(days=1)).isoformat(),
+        7,
+    )
+
+    def _mean(rows: list[dict], key: str) -> float | None:
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    components: dict[str, float | None] = {"hrv": None, "rhr": None, "sleep": None, "bb": None}
+
+    hrv_today = today.get("hrv_overnight")
+    hrv_base = _mean(baseline, "hrv_overnight")
+    if hrv_today is not None and hrv_base and hrv_base > 0:
+        components["hrv"] = _clamp((hrv_today - hrv_base) / hrv_base, -1.0, 1.0)
+
+    rhr_today = today.get("resting_hr")
+    rhr_base = _mean(baseline, "resting_hr")
+    if rhr_today is not None and rhr_base and rhr_base > 0:
+        # lower RHR is better — negate the deviation
+        components["rhr"] = _clamp(-(rhr_today - rhr_base) / rhr_base, -1.0, 1.0)
+
+    sleep_today = today.get("sleep_seconds")
+    if sleep_today is not None and cfg.sleep_target_hours > 0:
+        target_s = cfg.sleep_target_hours * 3600.0
+        components["sleep"] = _clamp((sleep_today - target_s) / target_s, -1.0, 1.0)
+
+    bb_today = today.get("body_battery")
+    if bb_today is not None:
+        # 50 ≈ neutral, 100 = best, 0 = worst.
+        components["bb"] = _clamp((bb_today - 50.0) / 50.0, -1.0, 1.0)
+
+    available = {k: v for k, v in components.items() if v is not None}
+    if not available:
+        return {"score": None, "band": None, "components": components}
+
+    weight_sum = sum(_READINESS_WEIGHTS[k] for k in available)
+    weighted = sum(_READINESS_WEIGHTS[k] * v for k, v in available.items()) / weight_sum
+    score = round(50 + 50 * weighted)
+    if score >= 80:
+        band = "high"
+    elif score >= 60:
+        band = "medium"
+    else:
+        band = "low"
+    return {"score": score, "band": band, "components": components}
+
+
+def daily_readiness_history(db_path: Path, days: int, cfg) -> list[dict]:
+    """[{date, score}] for the last `days` days ending today, oldest first.
+
+    Skips days where the score is None (no data) — caller renders empty cells.
+    """
+    today = datetime.now(timezone.utc).date()
+    out: list[dict] = []
+    for offset in range(days - 1, -1, -1):
+        d = (today - timedelta(days=offset)).isoformat()
+        r = composite_readiness(db_path, d, cfg)
+        out.append({"date": d, "score": r["score"], "band": r["band"]})
+    return out
+
+
+def _daily_activity_load(db_path: Path, end_date_iso: str, days: int) -> dict[str, int]:
+    """Date-keyed sum of activity calories over the window. Missing days = 0."""
+    end = date.fromisoformat(end_date_iso)
+    start = (end - timedelta(days=days - 1)).isoformat()
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT date, COALESCE(SUM(calories), 0) FROM activities "
+            "WHERE date >= ? AND date <= ? GROUP BY date",
+            (start, end_date_iso),
+        ).fetchall()
+    by_date = {r[0]: int(r[1] or 0) for r in rows}
+    out: dict[str, int] = {}
+    for offset in range(days):
+        d = (end - timedelta(days=days - 1 - offset)).isoformat()
+        out[d] = by_date.get(d, 0)
+    return out
+
+
+def acwr(db_path: Path, date_iso: str) -> dict:
+    """Acute:Chronic Workload Ratio = mean(7d load) / mean(28d load).
+
+    Sweet spot 0.8–1.3 (Gabbett 2016). >1.5 = elevated injury risk.
+    Returns {ratio, acute_avg, chronic_avg, band}. ratio=None if insufficient data.
+    """
+    loads_28 = list(_daily_activity_load(db_path, date_iso, 28).values())
+    if len(loads_28) < 28:
+        return {"ratio": None, "acute_avg": None, "chronic_avg": None, "band": None}
+    chronic = sum(loads_28) / 28.0
+    acute = sum(loads_28[-7:]) / 7.0
+    if chronic <= 0:
+        ratio = None
+        band = None
+    else:
+        ratio = acute / chronic
+        if ratio < 0.8:
+            band = "undertrained"
+        elif ratio <= 1.3:
+            band = "optimal"
+        elif ratio <= 1.5:
+            band = "caution"
+        else:
+            band = "high_risk"
+    return {
+        "ratio": round(ratio, 2) if ratio is not None else None,
+        "acute_avg": round(acute, 1),
+        "chronic_avg": round(chronic, 1),
+        "band": band,
+    }
+
+
+def training_monotony(db_path: Path, date_iso: str) -> dict:
+    """Foster's monotony: mean(daily load) / std(daily load) over last 7 days.
+
+    > 2.0 is generally considered monotonous (overuse risk). Returns
+    {monotony, band}. monotony=None if std is 0 (constant load) or fewer than
+    7 days of data.
+    """
+    loads = list(_daily_activity_load(db_path, date_iso, 7).values())
+    if len(loads) < 7:
+        return {"monotony": None, "band": None}
+    mean = sum(loads) / 7.0
+    if mean == 0:
+        return {"monotony": None, "band": "rest"}  # nothing trained; still meaningful
+    variance = sum((x - mean) ** 2 for x in loads) / 7.0
+    std = variance ** 0.5
+    if std == 0:
+        return {"monotony": None, "band": "monotonous"}
+    monotony = mean / std
+    if monotony >= 2.0:
+        band = "monotonous"
+    elif monotony >= 1.5:
+        band = "elevated"
+    else:
+        band = "varied"
+    return {"monotony": round(monotony, 2), "band": band}
+
+
+def z2_minutes_for_week(db_path: Path, end_date_iso: str, cfg) -> dict:
+    """Sum activity minutes whose avg HR sits in 60–70% of HRmax for the trailing 7 days.
+
+    Z2 (aerobic base) is the gold standard for endurance development. Goal: 150 min/week.
+    Returns {minutes, goal_minutes, hrmax, lower_bpm, upper_bpm, by_day}.
+    """
+    hrmax = _hrmax(cfg)
+    lower = round(0.60 * hrmax)
+    upper = round(0.70 * hrmax)
+    end = date.fromisoformat(end_date_iso)
+    start = (end - timedelta(days=6)).isoformat()
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT date, COALESCE(SUM(duration_s), 0) FROM activities "
+            "WHERE date >= ? AND date <= ? "
+            "AND avg_hr >= ? AND avg_hr <= ? "
+            "GROUP BY date",
+            (start, end_date_iso, lower, upper),
+        ).fetchall()
+    by_day_seconds = {r[0]: int(r[1] or 0) for r in rows}
+    by_day = []
+    total_s = 0
+    for offset in range(7):
+        d = (end - timedelta(days=6 - offset)).isoformat()
+        secs = by_day_seconds.get(d, 0)
+        by_day.append({"date": d, "minutes": secs // 60})
+        total_s += secs
+    return {
+        "minutes": total_s // 60,
+        "goal_minutes": 150,
+        "hrmax": hrmax,
+        "lower_bpm": lower,
+        "upper_bpm": upper,
+        "by_day": by_day,
+    }
+
+
+def sleep_debt(db_path: Path, end_date_iso: str, cfg) -> dict:
+    """Cumulative (target − actual) sleep over the trailing 7 days, in hours.
+
+    Positive total = net deficit. Negative = net surplus. by_day items report
+    the *signed* deficit per day (positive when short, negative when over).
+    """
+    rows = _last_n_summaries(db_path, end_date_iso, 7)
+    target_s = cfg.sleep_target_hours * 3600.0
+    by_date = {r["date"]: r.get("sleep_seconds") for r in rows}
+    by_day = []
+    total_s = 0.0
+    end = date.fromisoformat(end_date_iso)
+    for offset in range(7):
+        d = (end - timedelta(days=6 - offset)).isoformat()
+        actual = by_date.get(d)
+        if actual is None:
+            by_day.append({"date": d, "deficit_h": None})
+            continue
+        deficit = target_s - actual
+        total_s += deficit
+        by_day.append({"date": d, "deficit_h": round(deficit / 3600.0, 2)})
+    return {
+        "total_h": round(total_s / 3600.0, 2),
+        "target_h": cfg.sleep_target_hours,
+        "by_day": by_day,
+    }
