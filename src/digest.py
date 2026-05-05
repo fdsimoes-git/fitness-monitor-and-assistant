@@ -81,8 +81,9 @@ def build_digest(cfg: Config, target_date: date | None = None) -> str | None:
     summary = db.daily_summary_for(cfg.db_path, target_date.isoformat())
     ble_hrv = _ble_hrv_avg_for_date(cfg.db_path, target_date)
     activities = db.activities_for_date(cfg.db_path, target_date.isoformat())
+    meals = db.meals_for_date(cfg.db_path, target_date.isoformat())
 
-    if not summary and ble_hrv is None and not activities:
+    if not summary and ble_hrv is None and not activities and not meals:
         return None
 
     s = summary or {}
@@ -104,6 +105,21 @@ def build_digest(cfg: Config, target_date: date | None = None) -> str | None:
         lines.append("")
         for a in activities:
             lines.append(_format_activity_line(a))
+
+    balance = db.calorie_balance_for_date(cfg.db_path, target_date.isoformat())
+    if balance.get("meal_count", 0) > 0:
+        bal_kcal = balance["balance_kcal"]
+        sign = "surplus" if bal_kcal >= 0 else "deficit"
+        lines.append("")
+        lines.append(
+            f"🍽️ Nutrition: ate {balance['eaten_kcal']:.0f}kcal, "
+            f"burned {balance['burned_kcal']}kcal (activities) → "
+            f"{bal_kcal:+.0f}kcal {sign}"
+        )
+        lines.append(
+            f"💪 Macros: {balance['protein_g']:.0f}g protein / "
+            f"{balance['carbs_g']:.0f}g carbs / {balance['fat_g']:.0f}g fat"
+        )
     return "\n".join(lines)
 
 
