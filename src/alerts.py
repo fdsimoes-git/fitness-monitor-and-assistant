@@ -54,7 +54,7 @@ def maybe_alert(
             return False
 
     sent = send_telegram(cfg, text)
-    db.log_alert(cfg.db_path, kind, json.dumps(payload or {}), sent)
+    db.log_alert(cfg.db_path, kind, json.dumps(payload or {}), sent, message=text)
     if sent:
         log.info("Alert sent: %s", kind)
     return sent

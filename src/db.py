@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          TEXT NOT NULL,
     kind        TEXT NOT NULL,         -- e.g. 'hr_spike', 'resting_hr_high'
+    message     TEXT,                  -- the human-readable text that was sent
     payload     TEXT,                  -- JSON string with details
     sent_ok     INTEGER NOT NULL DEFAULT 0
 );
@@ -84,6 +85,15 @@ def init_db(db_path: Path) -> None:
     log.info("Initialising DB at %s", db_path)
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent column additions for DBs created before a column existed."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+    if "message" not in cols:
+        conn.execute("ALTER TABLE alerts ADD COLUMN message TEXT")
+        log.info("Migrated: added alerts.message column")
 
 
 def insert_hr(db_path: Path, bpm: int, rr_ms: list[int] | None = None) -> None:
@@ -175,13 +185,31 @@ def activities_for_date(db_path: Path, date_iso: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def log_alert(db_path: Path, kind: str, payload: str, sent_ok: bool) -> None:
+def log_alert(
+    db_path: Path,
+    kind: str,
+    payload: str,
+    sent_ok: bool,
+    message: str | None = None,
+) -> None:
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with connect(db_path) as conn:
         conn.execute(
-            "INSERT INTO alerts (ts, kind, payload, sent_ok) VALUES (?, ?, ?, ?)",
-            (ts, kind, payload, int(sent_ok)),
+            "INSERT INTO alerts (ts, kind, message, payload, sent_ok) VALUES (?, ?, ?, ?, ?)",
+            (ts, kind, message, payload, int(sent_ok)),
         )
+
+
+def recent_alerts(db_path: Path, limit: int = 10) -> list[dict]:
+    """Return most recent alerts, newest first."""
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, ts, kind, message, payload, sent_ok FROM alerts "
+            "ORDER BY ts DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def last_alert_ts(db_path: Path, kind: str) -> datetime | None:
