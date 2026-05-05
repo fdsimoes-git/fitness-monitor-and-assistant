@@ -36,6 +36,25 @@ def main(argv: list[str] | None = None) -> int:
     act_p = sub.add_parser("activities", help="Print recent activities from the DB")
     act_p.add_argument("--days", type=int, default=14, help="Window in days (default 14)")
 
+    log_meal_p = sub.add_parser("log-meal", help="Log a meal manually")
+    log_meal_p.add_argument("--desc", required=True, help="Food description")
+    log_meal_p.add_argument("--kcal", type=float)
+    log_meal_p.add_argument("--protein", type=float)
+    log_meal_p.add_argument("--carbs", type=float)
+    log_meal_p.add_argument("--fat", type=float)
+    log_meal_p.add_argument("--meal-time", help="ISO timestamp (defaults to now)")
+
+    log_bc_p = sub.add_parser("log-barcode", help="Lookup a barcode and log a meal")
+    log_bc_p.add_argument("barcode", help="EAN/UPC barcode")
+    log_bc_p.add_argument("--grams", type=float, help="Serving size in grams")
+    log_bc_p.add_argument("--meal-time", help="ISO timestamp (defaults to now)")
+
+    meals_p = sub.add_parser("meals", help="Show meals for a date with totals")
+    meals_p.add_argument("--date", help="ISO date (YYYY-MM-DD); default today")
+
+    bal_p = sub.add_parser("calorie-balance", help="Show eaten vs burned for a date")
+    bal_p.add_argument("--date", help="ISO date (YYYY-MM-DD); default today")
+
     args = p.parse_args(argv)
     cfg = Config.from_env()
     setup_logging(cfg.log_level)
@@ -110,6 +129,95 @@ def main(argv: list[str] | None = None) -> int:
                 f"  {(r.get('name') or ''):<28}"
                 f"  {mins:>4}min  {dist_str:>8}  HR {avg:>3}  {cals:>4}kcal  {te_str}"
             )
+        return 0
+
+    if args.cmd == "log-meal":
+        from . import db
+        meal = {
+            "description": args.desc,
+            "source": "manual",
+            "kcal": args.kcal,
+            "protein_g": args.protein,
+            "carbs_g": args.carbs,
+            "fat_g": args.fat,
+            "meal_time": args.meal_time,
+        }
+        mid = db.insert_meal(cfg.db_path, meal)
+        print(f"Logged meal #{mid}: {args.desc} ({args.kcal or '—'} kcal)")
+        return 0
+
+    if args.cmd == "log-barcode":
+        import json
+        from . import db, food
+        info = food.lookup_barcode(args.barcode)
+        if info is None:
+            print(f"Barcode {args.barcode} not found in Open Food Facts.")
+            return 1
+        grams = args.grams
+        if grams is None:
+            grams = info.get("serving_size_g") or 100.0
+            print(f"No --grams given; using {grams}g (serving size from API).")
+        factor = grams / 100.0
+
+        def _scale(per100: float | None) -> float | None:
+            return round(per100 * factor, 1) if per100 is not None else None
+
+        meal = {
+            "description": f"{info['name']} ({grams:.0f}g)",
+            "source": "barcode",
+            "barcode": args.barcode,
+            "kcal": _scale(info.get("kcal_100g")),
+            "protein_g": _scale(info.get("protein_100g")),
+            "carbs_g": _scale(info.get("carbs_100g")),
+            "fat_g": _scale(info.get("fat_100g")),
+            "meal_time": args.meal_time,
+            "raw_json": json.dumps(info.get("raw") or {}),
+        }
+        mid = db.insert_meal(cfg.db_path, meal)
+        print(
+            f"Logged meal #{mid}: {meal['description']} → "
+            f"{meal['kcal'] or '—'} kcal, "
+            f"P{meal['protein_g'] or '—'}/C{meal['carbs_g'] or '—'}/F{meal['fat_g'] or '—'}g"
+        )
+        return 0
+
+    if args.cmd == "meals":
+        from datetime import date as date_cls, datetime as dt_cls
+        from . import db
+        target = args.date or date_cls.today().isoformat()
+        rows = db.meals_for_date(cfg.db_path, target)
+        if not rows:
+            print(f"No meals on {target}.")
+            return 0
+        print(f"Meals on {target}:")
+        for r in rows:
+            try:
+                t = dt_cls.fromisoformat(r["meal_time"]).astimezone().strftime("%H:%M")
+            except (TypeError, ValueError):
+                t = (r.get("meal_time") or "")[11:16]
+            kcal = r.get("kcal")
+            kcal_str = f"{kcal:>5.0f}" if kcal is not None else "    —"
+            print(f"  {t}  {kcal_str} kcal  {r.get('description')}")
+        bal = db.calorie_balance_for_date(cfg.db_path, target)
+        print(
+            f"\nTotals: {bal['eaten_kcal']:.0f} kcal · "
+            f"P{bal['protein_g']:.0f}g / C{bal['carbs_g']:.0f}g / F{bal['fat_g']:.0f}g"
+        )
+        return 0
+
+    if args.cmd == "calorie-balance":
+        from datetime import date as date_cls
+        from . import db
+        target = args.date or date_cls.today().isoformat()
+        bal = db.calorie_balance_for_date(cfg.db_path, target)
+        sign = "surplus" if bal["balance_kcal"] >= 0 else "deficit"
+        print(
+            f"Calorie balance — {target}\n"
+            f"  Eaten:   {bal['eaten_kcal']:>6.0f} kcal ({bal['meal_count']} meals)\n"
+            f"  Burned:  {bal['burned_kcal']:>6} kcal (activities)\n"
+            f"  Balance: {bal['balance_kcal']:>+6.0f} kcal ({sign})\n"
+            f"  Macros:  P{bal['protein_g']:.0f}g / C{bal['carbs_g']:.0f}g / F{bal['fat_g']:.0f}g"
+        )
         return 0
 
     return 2
