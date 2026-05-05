@@ -1,0 +1,10 @@
+[Unit]
+Description=Prune old Garmin DB rows weekly (Sunday 03:00)
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+Unit=garmin-prune.service
+
+[Install]
+WantedBy=timers.target

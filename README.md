@@ -71,6 +71,26 @@ sudo systemctl enable --now garmin-ble.service   # optional, only if always near
                                                  └──────────┘
 ```
 
+## Storage & retention
+
+The BLE listener writes ~2 rows/sec to `hr_realtime` while the watch is broadcasting (~100 bytes/row including indexes). HRV samples are far smaller and infrequent. A 90-day rolling window therefore caps the on-disk DB at a few hundred MB even with continuous broadcast — well within Pi-class storage.
+
+`daily_summary` and `alerts` are kept forever (one row per day each, negligible size).
+
+A weekly cron-style timer prunes anything older than the retention window and runs `VACUUM` to reclaim space:
+
+```bash
+sudo cp systemd/garmin-prune.service systemd/garmin-prune.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now garmin-prune.timer
+```
+
+You can also run it manually, with a custom window:
+
+```bash
+.venv/bin/python -m src.cli prune --days 60
+```
+
 ## What's done vs what's next
 
 See [CLAUDE.md](./CLAUDE.md) — it's the source of truth for Claude Code (and humans) on conventions, current state, and the roadmap.

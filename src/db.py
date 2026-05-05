@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -166,6 +166,25 @@ def avg_hr_between(db_path: Path, start_iso: str, end_iso: str) -> tuple[float, 
     if not row or not row[1]:
         return None
     return (float(row[0]), int(row[1]))
+
+
+def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
+    """Delete rows older than `days` from hr_realtime and hrv, then VACUUM.
+
+    daily_summary and alerts are kept forever (one row per day, tiny).
+    Returns a dict of table_name -> rows deleted.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    deleted: dict[str, int] = {}
+    for table in ("hr_realtime", "hrv"):
+        cur = con.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+        deleted[table] = cur.rowcount or 0
+    con.execute("VACUUM")
+    log.info(
+        "Pruned rows older than %s (cutoff=%s): hr_realtime=%d hrv=%d",
+        f"{days}d", cutoff, deleted["hr_realtime"], deleted["hrv"],
+    )
+    return deleted
 
 
 def daily_summary_for(db_path: Path, date_iso: str) -> dict | None:

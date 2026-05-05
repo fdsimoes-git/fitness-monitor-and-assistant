@@ -1,0 +1,10 @@
+[Unit]
+Description=Garmin DB prune (oneshot)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/garmin-monitor
+EnvironmentFile=/home/pi/garmin-monitor/.env
+ExecStart=/home/pi/garmin-monitor/.venv/bin/python -m src.cli prune
+User=pi

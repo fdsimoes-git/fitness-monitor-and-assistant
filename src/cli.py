@@ -31,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     dash_p = sub.add_parser("dashboard", help="Run the FastAPI dashboard (optional)")
     dash_p.add_argument("--host", default="127.0.0.1")
     dash_p.add_argument("--port", type=int, default=8000)
+    prune_p = sub.add_parser("prune", help="Delete old hr_realtime/hrv rows and VACUUM")
+    prune_p.add_argument("--days", type=int, default=90, help="Retention window in days (default 90)")
 
     args = p.parse_args(argv)
     cfg = Config.from_env()
@@ -73,6 +75,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "dashboard":
         from . import dashboard
         dashboard.serve(cfg, host=args.host, port=args.port)
+        return 0
+
+    if args.cmd == "prune":
+        from . import db
+        with db.connect(cfg.db_path) as conn:
+            deleted = db.prune_old_data(conn, days=args.days)
+        print(
+            f"Pruned (>{args.days}d): hr_realtime={deleted['hr_realtime']} "
+            f"hrv={deleted['hrv']}"
+        )
         return 0
 
     return 2
