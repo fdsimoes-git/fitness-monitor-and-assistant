@@ -31,8 +31,10 @@ def main(argv: list[str] | None = None) -> int:
     dash_p = sub.add_parser("dashboard", help="Run the FastAPI dashboard (optional)")
     dash_p.add_argument("--host", default="127.0.0.1")
     dash_p.add_argument("--port", type=int, default=8000)
-    prune_p = sub.add_parser("prune", help="Delete old hr_realtime/hrv rows and VACUUM")
+    prune_p = sub.add_parser("prune", help="Delete old hr_realtime/hrv/activities rows and VACUUM")
     prune_p.add_argument("--days", type=int, default=90, help="Retention window in days (default 90)")
+    act_p = sub.add_parser("activities", help="Print recent activities from the DB")
+    act_p.add_argument("--days", type=int, default=14, help="Window in days (default 14)")
 
     args = p.parse_args(argv)
     cfg = Config.from_env()
@@ -83,8 +85,30 @@ def main(argv: list[str] | None = None) -> int:
             deleted = db.prune_old_data(conn, days=args.days)
         print(
             f"Pruned (>{args.days}d): hr_realtime={deleted['hr_realtime']} "
-            f"hrv={deleted['hrv']}"
+            f"hrv={deleted['hrv']} activities={deleted['activities']}"
         )
+        return 0
+
+    if args.cmd == "activities":
+        from . import db
+        rows = db.recent_activities(cfg.db_path, days=args.days)
+        if not rows:
+            print(f"No activities in the last {args.days} days.")
+            return 0
+        for r in rows:
+            dur = r.get("duration_s") or 0
+            mins = dur // 60
+            dist_km = (r["distance_m"] / 1000.0) if r.get("distance_m") else None
+            dist_str = f"{dist_km:.2f}km" if dist_km else "—"
+            avg = r.get("avg_hr") or "—"
+            cals = r.get("calories") or "—"
+            te = r.get("training_effect")
+            te_str = f"TE {te:.1f}" if te is not None else "TE —"
+            print(
+                f"{r['date']}  {(r.get('activity_type') or '?'):<18}"
+                f"  {(r.get('name') or ''):<28}"
+                f"  {mins:>4}min  {dist_str:>8}  HR {avg:>3}  {cals:>4}kcal  {te_str}"
+            )
         return 0
 
     return 2

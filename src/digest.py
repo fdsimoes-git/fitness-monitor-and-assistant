@@ -45,13 +45,44 @@ def _ble_hrv_avg_for_date(db_path: Path, target_date: date) -> float | None:
     return float(row["avg"])
 
 
+_ACTIVITY_EMOJI = {
+    "running": "🏃",
+    "treadmill_running": "🏃",
+    "trail_running": "🏃",
+    "cycling": "🚴",
+    "road_biking": "🚴",
+    "mountain_biking": "🚴",
+    "indoor_cycling": "🚴",
+    "swimming": "🏊",
+    "lap_swimming": "🏊",
+    "open_water_swimming": "🏊",
+    "walking": "🚶",
+    "hiking": "🥾",
+    "strength_training": "🏋️",
+    "yoga": "🧘",
+}
+
+
+def _format_activity_line(a: dict) -> str:
+    atype = a.get("activity_type") or "activity"
+    emoji = _ACTIVITY_EMOJI.get(atype, "💪")
+    label = atype.replace("_", " ").title()
+    mins = (a.get("duration_s") or 0) // 60
+    avg = a.get("avg_hr")
+    parts = [f"{emoji} {label} {mins}min"]
+    if avg:
+        parts.append(f"avg {avg}bpm")
+    return ", ".join(parts)
+
+
 def build_digest(cfg: Config, target_date: date | None = None) -> str | None:
     """Build the digest text. Returns None if no data exists for the target date."""
     target_date = target_date or (date.today() - timedelta(days=1))
     summary = db.daily_summary_for(cfg.db_path, target_date.isoformat())
     ble_hrv = _ble_hrv_avg_for_date(cfg.db_path, target_date)
+    activities = db.activities_for_date(cfg.db_path, target_date.isoformat())
 
-    if not summary and ble_hrv is None:
+    if not summary and ble_hrv is None and not activities:
         return None
 
     s = summary or {}
@@ -69,6 +100,10 @@ def build_digest(cfg: Config, target_date: date | None = None) -> str | None:
     ]
     if ble_hrv is not None:
         lines.append(f"• HRV (BLE day avg): {ble_hrv:.0f} ms")
+    if activities:
+        lines.append("")
+        for a in activities:
+            lines.append(_format_activity_line(a))
     return "\n".join(lines)
 
 

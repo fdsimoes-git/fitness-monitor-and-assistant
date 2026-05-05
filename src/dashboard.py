@@ -65,6 +65,13 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="card" style="margin-top:1rem;">
+    <h3>Activities — last 7d</h3>
+    <div hx-get="/partials/activities" hx-trigger="load, every 60s" hx-swap="innerHTML">
+      Loading...
+    </div>
+  </div>
+
   <script>
     async function loadChart(elId, url, label) {
       const data = await fetch(url).then(r => r.json());
@@ -118,6 +125,41 @@ def _daily_recent(db_path, days: int = 14) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _activities_table_html(rows: list[dict]) -> str:
+    if not rows:
+        return "<p class='meta'>No activities in the last 7 days.</p>"
+
+    def fmt_dur(s):
+        if not s:
+            return "—"
+        m, sec = divmod(int(s), 60)
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m" if h else f"{m}m{sec:02d}s"
+
+    def fmt_dist(d):
+        return f"{d / 1000:.2f} km" if d else "—"
+
+    head = (
+        "<thead><tr><th>Date</th><th>Type</th><th>Name</th>"
+        "<th>Duration</th><th>Distance</th><th>Avg HR</th>"
+        "<th>Calories</th></tr></thead>"
+    )
+    body_rows = []
+    for r in rows:
+        body_rows.append(
+            "<tr>"
+            f"<td>{r['date']}</td>"
+            f"<td>{r.get('activity_type') or '—'}</td>"
+            f"<td>{r.get('name') or '—'}</td>"
+            f"<td>{fmt_dur(r.get('duration_s'))}</td>"
+            f"<td>{fmt_dist(r.get('distance_m'))}</td>"
+            f"<td>{r.get('avg_hr') or '—'}</td>"
+            f"<td>{r.get('calories') or '—'}</td>"
+            "</tr>"
+        )
+    return f"<table>{head}<tbody>{''.join(body_rows)}</tbody></table>"
+
+
 def _daily_table_html(rows: list[dict]) -> str:
     if not rows:
         return "<p class='meta'>No daily summaries yet — run <code>python -m src.cli poll</code>.</p>"
@@ -169,6 +211,10 @@ def create_app(cfg: Config) -> "FastAPI":
     @app.get("/partials/daily", response_class=HTMLResponse)
     def partial_daily() -> str:
         return _daily_table_html(_daily_recent(cfg.db_path))
+
+    @app.get("/partials/activities", response_class=HTMLResponse)
+    def partial_activities() -> str:
+        return _activities_table_html(db.recent_activities(cfg.db_path, days=7))
 
     return app
 

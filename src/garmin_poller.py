@@ -33,6 +33,39 @@ def _coerce_int(v) -> int | None:
         return None
 
 
+def _coerce_float(v) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_activity(raw: dict) -> dict | None:
+    """Map a Garmin activity payload to our `activities` columns.
+
+    Returns None if the payload lacks an activity id (we can't dedupe without it).
+    """
+    aid = raw.get("activityId")
+    if aid is None:
+        return None
+    # startTimeLocal is "YYYY-MM-DD HH:MM:SS" already in the user's local TZ.
+    start_local = raw.get("startTimeLocal") or ""
+    activity_date = start_local[:10] if len(start_local) >= 10 else None
+    activity_type = (raw.get("activityType") or {}).get("typeKey")
+    return {
+        "activity_id": str(aid),
+        "date": activity_date,
+        "activity_type": activity_type,
+        "name": raw.get("activityName"),
+        "duration_s": _coerce_int(raw.get("duration")),
+        "distance_m": _coerce_float(raw.get("distance")),
+        "avg_hr": _coerce_int(raw.get("averageHR")),
+        "max_hr": _coerce_int(raw.get("maxHR")),
+        "calories": _coerce_int(raw.get("calories")),
+        "training_effect": _coerce_float(raw.get("aerobicTrainingEffect")),
+    }
+
+
 def normalize_stats(raw: dict | None) -> dict:
     """Pull HR / steps / body battery off the daily stats payload."""
     raw = raw or {}
@@ -154,6 +187,23 @@ def run_once(cfg: Config) -> None:
         summary.get("hrv_overnight"),
     )
     db.upsert_daily_summary(cfg.db_path, today, summary)
+
+    # Fetch the most recent activities (single call per poll — respects rate limits).
+    try:
+        raw_activities = client.get_activities(0, 10) or []
+    except Exception as e:  # noqa: BLE001
+        log.warning("Garmin activities fetch failed: %s", e)
+        raw_activities = []
+
+    stored = 0
+    for raw in raw_activities:
+        norm = normalize_activity(raw)
+        if not norm:
+            continue
+        db.upsert_activity(cfg.db_path, norm)
+        stored += 1
+    log.info("Activities stored: %d (of %d fetched)", stored, len(raw_activities))
+
     check_resting_hr(cfg, summary)
     run_smart_alerts(cfg)
     log.info("Poll complete")

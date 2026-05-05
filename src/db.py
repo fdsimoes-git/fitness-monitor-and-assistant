@@ -50,6 +50,21 @@ CREATE TABLE IF NOT EXISTS hrv (
     source      TEXT NOT NULL DEFAULT 'ble'
 );
 CREATE INDEX IF NOT EXISTS idx_hrv_ts ON hrv(ts);
+
+CREATE TABLE IF NOT EXISTS activities (
+    activity_id     TEXT PRIMARY KEY, -- Garmin activity ID
+    date            TEXT NOT NULL,    -- YYYY-MM-DD local
+    activity_type   TEXT,
+    name            TEXT,
+    duration_s      INTEGER,
+    distance_m      REAL,
+    avg_hr          INTEGER,
+    max_hr          INTEGER,
+    calories        INTEGER,
+    training_effect REAL,
+    fetched_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
 """
 
 
@@ -112,6 +127,54 @@ def upsert_daily_summary(db_path: Path, date: str, fields: dict) -> None:
         )
 
 
+def upsert_activity(db_path: Path, fields: dict) -> None:
+    """Insert or update one activity. Required key: `activity_id`. Other keys mirror columns."""
+    cols = [
+        "activity_id", "date", "activity_type", "name",
+        "duration_s", "distance_m", "avg_hr", "max_hr",
+        "calories", "training_effect",
+    ]
+    values = {c: fields.get(c) for c in cols}
+    if not values["activity_id"]:
+        raise ValueError("upsert_activity requires activity_id")
+    values["fetched_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    placeholders = ", ".join(f":{k}" for k in values)
+    columns_sql = ", ".join(values.keys())
+    update_sql = ", ".join(
+        f"{c}=excluded.{c}" for c in values.keys() if c != "activity_id"
+    )
+
+    with connect(db_path) as conn:
+        conn.execute(
+            f"INSERT INTO activities ({columns_sql}) VALUES ({placeholders}) "
+            f"ON CONFLICT(activity_id) DO UPDATE SET {update_sql}",
+            values,
+        )
+
+
+def recent_activities(db_path: Path, days: int = 7) -> list[dict]:
+    """Return activities with `date` within the last `days` days, newest first."""
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM activities WHERE date >= ? ORDER BY date DESC, activity_id DESC",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def activities_for_date(db_path: Path, date_iso: str) -> list[dict]:
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM activities WHERE date = ? ORDER BY activity_id DESC",
+            (date_iso,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def log_alert(db_path: Path, kind: str, payload: str, sent_ok: bool) -> None:
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with connect(db_path) as conn:
@@ -169,20 +232,25 @@ def avg_hr_between(db_path: Path, start_iso: str, end_iso: str) -> tuple[float, 
 
 
 def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
-    """Delete rows older than `days` from hr_realtime and hrv, then VACUUM.
+    """Delete rows older than `days` from hr_realtime, hrv, activities; then VACUUM.
 
     daily_summary and alerts are kept forever (one row per day, tiny).
     Returns a dict of table_name -> rows deleted.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    cutoff_date = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
     deleted: dict[str, int] = {}
     for table in ("hr_realtime", "hrv"):
-        cur = con.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+        cur = con.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff_ts,))
         deleted[table] = cur.rowcount or 0
+    cur = con.execute("DELETE FROM activities WHERE date < ?", (cutoff_date,))
+    deleted["activities"] = cur.rowcount or 0
     con.execute("VACUUM")
     log.info(
-        "Pruned rows older than %s (cutoff=%s): hr_realtime=%d hrv=%d",
-        f"{days}d", cutoff, deleted["hr_realtime"], deleted["hrv"],
+        "Pruned rows older than %s (cutoff_ts=%s cutoff_date=%s): "
+        "hr_realtime=%d hrv=%d activities=%d",
+        f"{days}d", cutoff_ts, cutoff_date,
+        deleted["hr_realtime"], deleted["hrv"], deleted["activities"],
     )
     return deleted
 
