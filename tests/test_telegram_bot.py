@@ -88,6 +88,43 @@ def test_dispatch_handles_help_command(tmpdb):
     assert "garmin-monitor bot" in mock_send.call_args.args[1]
 
 
+def test_dispatch_routes_ask_to_chat(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    with patch("src.telegram_bot.llm.chat", return_value="Your protein is on track.") as mock_chat, \
+         patch("src.telegram_bot._send_plain") as mock_send:
+        telegram_bot.dispatch(cfg, _msg(text="/ask How's my protein this week?"), {})
+    mock_chat.assert_called_once_with(cfg, "How's my protein this week?")
+    mock_send.assert_called_once()
+    assert "protein is on track" in mock_send.call_args.args[1]
+
+
+def test_dispatch_chat_alias_routes_to_chat(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    with patch("src.telegram_bot.llm.chat", return_value="ok") as mock_chat, \
+         patch("src.telegram_bot._send_plain"):
+        telegram_bot.dispatch(cfg, _msg(text="/chat sleep tonight?"), {})
+    mock_chat.assert_called_once_with(cfg, "sleep tonight?")
+
+
+def test_dispatch_ask_without_body_shows_usage(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    with patch("src.telegram_bot.llm.chat") as mock_chat, \
+         patch("src.telegram_bot._send_plain") as mock_send:
+        telegram_bot.dispatch(cfg, _msg(text="/ask"), {})
+    mock_chat.assert_not_called()
+    mock_send.assert_called_once()
+    assert "after the command" in mock_send.call_args.args[1].lower()
+
+
+def test_dispatch_ask_handles_chat_returning_none(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    with patch("src.telegram_bot.llm.chat", return_value=None), \
+         patch("src.telegram_bot._send_plain") as mock_send:
+        telegram_bot.dispatch(cfg, _msg(text="/ask broken question"), {})
+    mock_send.assert_called_once()
+    assert "couldn't reach Claude" in mock_send.call_args.args[1]
+
+
 def test_dispatch_today_command_pulls_balance(tmpdb):
     cfg = _make_cfg(tmpdb)
     with patch("src.telegram_bot.alerts.send_telegram") as mock_send, \

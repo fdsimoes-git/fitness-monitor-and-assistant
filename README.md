@@ -24,12 +24,13 @@ cp .env.example .env
 3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy your `chat.id`
 4. Drop both into `.env`
 
-## Telegram meal-logging bot (optional)
+## Telegram bot (optional)
 
-The same Telegram bot used for alerts can also accept inbound meal logs powered by Claude. You can:
-- Send a free-text description (`"oat porridge with banana ~350 kcal"`)
+The same Telegram bot used for alerts also accepts inbound meal logs and free-form questions about your data, both powered by Claude. You can:
+- Send a free-text meal description (`"oat porridge with banana ~350 kcal"`)
 - Send a photo of your plate or a packaged product (Confirm/Cancel before logging)
 - Send a numeric barcode (8–14 digits)
+- `/ask How's my protein this week?` (alias `/chat`) — Claude reads from your local DB and answers
 - Run `/help`, `/today`, or `/balance`
 
 ```bash

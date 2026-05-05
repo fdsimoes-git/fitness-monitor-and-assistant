@@ -98,6 +98,7 @@ All frontend assets (Tailwind, Chart.js, htmx) come from CDN — no build step.
 - **Photo** → `getFile` → `llm.extract_meal_from_photo` (Claude vision with two tools: `record_meal` + `extract_barcode`). If a barcode is in frame, route through OFF; otherwise use the visual estimate. Either way, surface a Confirm/Cancel inline keyboard before persisting.
 - **`callback_query`** → confirm/cancel against an in-process `pending` dict.
 - **`/help`, `/today`, `/balance`** → static help / today's calorie balance.
+- **`/ask <question>` (alias `/chat`)** → `llm.chat`, an agentic tool-use loop with eight read-only DB tools (`get_balance`, `get_meals`, `get_recent_meals`, `get_daily_summary`, `get_trends`, `get_activities`, `get_readiness`, `get_training_intel`). Claude can chain calls; the loop is capped at `CHAT_MAX_ITERATIONS=6`. The system prompt includes today's date so Claude can resolve relative time ("yesterday", "this week") to ISO dates before calling tools.
 
 `src/llm.py` mirrors the credential-resolution pattern from `asset-management/server.js` (lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set we use the OAuth route (Bearer token + `anthropic-beta: oauth-2025-04-20` header + a system prefix identifying the request as Claude Code) so calls bill to the user's Claude Code subscription; otherwise we use the standard `ANTHROPIC_API_KEY` route. Default model `claude-sonnet-4-6`; override via `CLAUDE_MODEL`.
 

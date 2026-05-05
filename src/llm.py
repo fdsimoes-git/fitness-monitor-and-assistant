@@ -1,18 +1,25 @@
 """Claude integration for the Telegram meal-logging bot.
 
-Two paths:
+Three paths:
 
-1. **Text** — `extract_meal_from_text(cfg, user_text)` calls Claude with the
-   `record_meal` tool forced. The user message is the raw description; the
-   tool's input is the structured row we hand to `db.insert_meal`.
+1. **Text → meal** — `extract_meal_from_text(cfg, user_text)` calls Claude
+   with the `record_meal` tool forced. The user message is the raw
+   description; the tool's input is the structured row we hand to
+   `db.insert_meal`.
 
-2. **Photo** — `extract_meal_from_photo(cfg, image_bytes, mime_type)` calls
+2. **Photo → meal or barcode** — `extract_meal_from_photo(...)` calls
    Claude with two tools (`record_meal` + `extract_barcode`) and lets the
    model pick. If a packaged product's barcode is in frame, Claude returns
-   the digits and the bot routes through Open Food Facts for exact data;
-   otherwise Claude visually estimates the meal and returns a `record_meal`
-   call. **Image bytes are never persisted** — they live on the stack only
-   for the duration of the API call.
+   the digits and the bot routes through Open Food Facts; otherwise Claude
+   visually estimates the meal. **Image bytes are never persisted** — they
+   live on the stack only for the duration of the API call.
+
+3. **Free-form chat** — `chat(cfg, user_text)` runs an agentic loop with
+   eight read-only tools that query the local DB (balance, meals, daily
+   summary, trends, activities, readiness, training intel). Triggered by
+   `/ask <prompt>` or `/chat <prompt>` in Telegram. Claude can chain
+   tool calls; we cap iterations at `CHAT_MAX_ITERATIONS` to stop
+   runaways.
 
 Credential resolution mirrors the asset-management pattern (`server.js`
 lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set, calls go via the OAuth
@@ -27,9 +34,12 @@ error rather than a proper auth failure — see `CLAUDE.md` gotchas.
 from __future__ import annotations
 
 import base64
+import json
 import logging
+from datetime import date, timedelta
 from typing import Any, NamedTuple
 
+from . import db
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -293,4 +303,244 @@ def extract_meal_from_photo(
         "Claude returned no recognisable tool_use from photo (stop_reason=%s)",
         getattr(response, "stop_reason", "?"),
     )
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Chat with read-only DB tools (data-aware /ask flow)
+# ──────────────────────────────────────────────────────────────────────────────
+
+CHAT_MAX_ITERATIONS = 6  # cap on tool-use loops per /ask invocation
+
+
+# Tools the model can call to inspect the user's local DB. All are read-only;
+# the chat path never inserts, updates, or deletes. Schemas are intentionally
+# small — Claude does the heavy lifting of mapping natural-language questions
+# to the right tool + args.
+CHAT_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "get_balance",
+        "description": (
+            "Calorie balance for one date: eaten kcal, burned breakdown "
+            "(BMR + step kcal + activity kcal), net balance, and macro totals."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "ISO YYYY-MM-DD; defaults to today."},
+            },
+        },
+    },
+    {
+        "name": "get_meals",
+        "description": "Every meal logged for one date — time, description, kcal, macros, food category.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "ISO YYYY-MM-DD; defaults to today."},
+            },
+        },
+    },
+    {
+        "name": "get_recent_meals",
+        "description": (
+            "All meals logged across the last N days, oldest first. "
+            "Use for eating-pattern questions (frequency, timing, repeated foods)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Window in days; capped at 30. Default 7."},
+            },
+        },
+    },
+    {
+        "name": "get_daily_summary",
+        "description": (
+            "Garmin's per-day metrics for one date: resting HR, max HR, avg HR, steps, "
+            "sleep seconds, average stress, body battery, overnight HRV."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "ISO YYYY-MM-DD; defaults to today."},
+            },
+        },
+    },
+    {
+        "name": "get_trends",
+        "description": (
+            "Daily metrics (date, resting_hr, hrv_overnight) for the last N days. "
+            "Use for trend questions ('is my RHR rising?', 'how's HRV been?')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Window in days; capped at 90. Default 14."},
+            },
+        },
+    },
+    {
+        "name": "get_activities",
+        "description": "Recent Garmin activities — type, duration, distance, avg HR, calories, training effect.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Window in days; capped at 90. Default 14."},
+            },
+        },
+    },
+    {
+        "name": "get_readiness",
+        "description": (
+            "Composite readiness score (0-100) plus the four component deltas vs the "
+            "user's 7-day baseline (HRV, RHR, sleep, body battery)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "ISO YYYY-MM-DD; defaults to today."},
+            },
+        },
+    },
+    {
+        "name": "get_training_intel",
+        "description": (
+            "Acute-to-chronic workload ratio (Gabbett bands), Foster training monotony, "
+            "Z2 minutes for the trailing week, and 7-day sleep debt."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "ISO YYYY-MM-DD; defaults to today."},
+            },
+        },
+    },
+]
+
+
+def _execute_chat_tool(name: str, input_data: dict, cfg: Config) -> Any:
+    """Dispatcher mapping tool name → existing db.py helper. Returns a JSON-
+    serializable result, or `{"error": "..."}` on a recognised failure."""
+    today = date.today().isoformat()
+    target = (input_data.get("date") or today)
+
+    if name == "get_balance":
+        return db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg)
+    if name == "get_meals":
+        return db.meals_for_date(cfg.db_path, target)
+    if name == "get_recent_meals":
+        days = max(1, min(int(input_data.get("days") or 7), 30))
+        out: list[dict] = []
+        today_d = date.today()
+        for offset in range(days - 1, -1, -1):
+            d_iso = (today_d - timedelta(days=offset)).isoformat()
+            out.extend(db.meals_for_date(cfg.db_path, d_iso))
+        return out
+    if name == "get_daily_summary":
+        return db.daily_summary_for(cfg.db_path, target)
+    if name == "get_trends":
+        days = max(1, min(int(input_data.get("days") or 14), 90))
+        return db.recent_daily_metrics(cfg.db_path, days)
+    if name == "get_activities":
+        days = max(1, min(int(input_data.get("days") or 14), 90))
+        return db.recent_activities(cfg.db_path, days=days)
+    if name == "get_readiness":
+        return db.composite_readiness(cfg.db_path, target, cfg)
+    if name == "get_training_intel":
+        return {
+            "acwr": db.acwr(cfg.db_path, target),
+            "monotony": db.training_monotony(cfg.db_path, target),
+            "z2": db.z2_minutes_for_week(cfg.db_path, target, cfg),
+            "sleep_debt": db.sleep_debt(cfg.db_path, target, cfg),
+        }
+    return {"error": f"Unknown tool: {name}"}
+
+
+_CHAT_SYSTEM_TEMPLATE = (
+    "You are the user's personal health assistant for the garmin-monitor app. "
+    "You can query their local SQLite database via the provided tools. "
+    "Today is {today}.\n\n"
+    "Rules:\n"
+    "• Cite specific numbers from the tool results — never invent values.\n"
+    "• If the data isn't there, say so plainly (\"no meals logged yesterday\").\n"
+    "• Replies are rendered in a Telegram chat: keep them concise (2–4 sentences "
+    "unless the user asks for detail). Plain text — no Markdown.\n"
+    "• When the user asks about \"yesterday\", \"this week\", etc., resolve to ISO dates "
+    "yourself before calling tools.\n"
+    "• You may call multiple tools in sequence to answer one question."
+)
+
+
+def chat(cfg: Config, user_text: str) -> str | None:
+    """Run an agentic conversation turn against `CHAT_TOOLS` and return the
+    final text answer. Returns `None` if no credentials, no text in the final
+    reply, or the loop exceeds `CHAT_MAX_ITERATIONS`.
+    """
+    auth = resolve_anthropic_auth(cfg)
+    if not auth.has_creds:
+        log.warning("No Anthropic credentials — set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN")
+        return None
+
+    client = build_anthropic_client(auth)
+    system = build_system_prompt(
+        auth, _CHAT_SYSTEM_TEMPLATE.format(today=date.today().isoformat())
+    )
+    messages: list[dict] = [{"role": "user", "content": user_text}]
+
+    for iteration in range(CHAT_MAX_ITERATIONS):
+        response = client.messages.create(
+            model=cfg.claude_model or DEFAULT_MODEL,
+            max_tokens=1024,
+            system=system,
+            messages=messages,
+            tools=CHAT_TOOLS,
+        )
+
+        if getattr(response, "stop_reason", None) == "tool_use":
+            # Append the assistant turn (the SDK content list serializes itself
+            # back through the API) and execute every tool_use block.
+            messages.append({"role": "assistant", "content": list(response.content)})
+            tool_results: list[dict] = []
+            for block in response.content:
+                btype = getattr(block, "type", None) or (
+                    block.get("type") if isinstance(block, dict) else None
+                )
+                if btype != "tool_use":
+                    continue
+                name = getattr(block, "name", None) or (
+                    block.get("name") if isinstance(block, dict) else None
+                )
+                input_data = _block_input(block)
+                try:
+                    result = _execute_chat_tool(name, input_data, cfg)
+                except Exception as e:  # noqa: BLE001 — surface as tool error to Claude
+                    log.exception("Chat tool %s raised", name)
+                    result = {"error": str(e)}
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": getattr(block, "id", None) or (
+                        block.get("id") if isinstance(block, dict) else None
+                    ),
+                    "content": json.dumps(result, default=str),
+                })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        # Anything else (end_turn, stop_sequence, max_tokens) — collect text.
+        texts: list[str] = []
+        for block in response.content:
+            btype = getattr(block, "type", None) or (
+                block.get("type") if isinstance(block, dict) else None
+            )
+            if btype != "text":
+                continue
+            t = getattr(block, "text", None) or (
+                block.get("text") if isinstance(block, dict) else None
+            )
+            if t:
+                texts.append(t)
+        return "\n".join(texts).strip() or None
+
+    log.warning("chat() exceeded %d tool-use iterations", CHAT_MAX_ITERATIONS)
     return None

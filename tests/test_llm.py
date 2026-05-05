@@ -214,3 +214,128 @@ def test_extract_meal_from_photo_returns_none_when_no_tool_use():
 def test_extract_meal_from_photo_returns_none_without_credentials():
     out = llm.extract_meal_from_photo(_make_cfg(), b"jpegbytes", "image/jpeg")
     assert out is None
+
+
+# ── chat (data-aware /ask) ──────────────────────────────────────────────────
+
+
+def _text_block(text: str) -> SimpleNamespace:
+    return SimpleNamespace(type="text", text=text)
+
+
+def _tool_use_block(tool_id: str, name: str, input_data: dict) -> SimpleNamespace:
+    return SimpleNamespace(type="tool_use", id=tool_id, name=name, input=input_data)
+
+
+def test_chat_returns_text_on_end_turn():
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("Your protein has been steady at 110g/day.")],
+        stop_reason="end_turn",
+    )
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        out = llm.chat(cfg, "How's my protein?")
+    assert out == "Your protein has been steady at 110g/day."
+    assert fake_client.messages.create.call_count == 1
+
+
+def test_chat_returns_none_without_credentials():
+    out = llm.chat(_make_cfg(), "anything")
+    assert out is None
+
+
+def test_chat_loops_through_tool_use():
+    """tool_use → execute → tool_result → final text."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    tool_use_resp = SimpleNamespace(
+        content=[_tool_use_block("tu_1", "get_balance", {})],
+        stop_reason="tool_use",
+    )
+    final_resp = SimpleNamespace(
+        content=[_text_block("You're 200 kcal under today.")],
+        stop_reason="end_turn",
+    )
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [tool_use_resp, final_resp]
+    with patch("src.llm.build_anthropic_client", return_value=fake_client), \
+         patch("src.llm.db.calorie_balance_for_date",
+               return_value={"balance_kcal": -200, "eaten_kcal": 1500, "meal_count": 2}):
+        out = llm.chat(cfg, "How's my balance today?")
+    assert "200 kcal under" in out
+    assert fake_client.messages.create.call_count == 2
+    # Second call's messages should include both the assistant turn AND a tool_result.
+    second_messages = fake_client.messages.create.call_args_list[1].kwargs["messages"]
+    assert second_messages[-1]["role"] == "user"
+    tool_results = second_messages[-1]["content"]
+    assert tool_results[0]["type"] == "tool_result"
+    assert tool_results[0]["tool_use_id"] == "tu_1"
+    # The serialized result body should mention the balance number we mocked.
+    assert "balance_kcal" in tool_results[0]["content"]
+
+
+def test_chat_caps_iterations():
+    """A model that always returns tool_use shouldn't run forever."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    looping = SimpleNamespace(
+        content=[_tool_use_block("tu_x", "get_balance", {})],
+        stop_reason="tool_use",
+    )
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = looping
+    with patch("src.llm.build_anthropic_client", return_value=fake_client), \
+         patch("src.llm.db.calorie_balance_for_date", return_value={}):
+        out = llm.chat(cfg, "loop forever")
+    assert out is None
+    assert fake_client.messages.create.call_count == llm.CHAT_MAX_ITERATIONS
+
+
+def test_chat_swallows_tool_exceptions_into_error_results():
+    """A failing tool shouldn't crash the loop — Claude sees an error result instead."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    tool_use_resp = SimpleNamespace(
+        content=[_tool_use_block("tu_1", "get_balance", {})],
+        stop_reason="tool_use",
+    )
+    final_resp = SimpleNamespace(
+        content=[_text_block("I had trouble reading the balance.")],
+        stop_reason="end_turn",
+    )
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [tool_use_resp, final_resp]
+    with patch("src.llm.build_anthropic_client", return_value=fake_client), \
+         patch("src.llm.db.calorie_balance_for_date", side_effect=RuntimeError("disk full")):
+        out = llm.chat(cfg, "today balance?")
+    assert out == "I had trouble reading the balance."
+    second_call = fake_client.messages.create.call_args_list[1]
+    tool_result_block = second_call.kwargs["messages"][-1]["content"][0]
+    assert "disk full" in tool_result_block["content"]
+
+
+# ── _execute_chat_tool dispatcher ───────────────────────────────────────────
+
+
+@pytest.fixture
+def tmpdb_cfg(tmp_path):
+    """A real (tmp) DB so dispatcher tests exercise the actual db.py helpers."""
+    from src import db as _db
+    p = tmp_path / "t.db"
+    _db.init_db(p)
+    return _make_cfg(db_path=p, anthropic_api_key="sk-ant-api03-x")
+
+
+def test_execute_chat_tool_get_balance_uses_today(tmpdb_cfg):
+    out = llm._execute_chat_tool("get_balance", {}, tmpdb_cfg)
+    assert "balance_kcal" in out
+    assert out["meal_count"] == 0
+
+
+def test_execute_chat_tool_get_recent_meals_caps_at_30(tmpdb_cfg):
+    out = llm._execute_chat_tool("get_recent_meals", {"days": 9999}, tmpdb_cfg)
+    assert isinstance(out, list)
+
+
+def test_execute_chat_tool_unknown_returns_error(tmpdb_cfg):
+    out = llm._execute_chat_tool("get_does_not_exist", {}, tmpdb_cfg)
+    assert "error" in out
+    assert "Unknown tool" in out["error"]

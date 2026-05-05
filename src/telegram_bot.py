@@ -49,14 +49,23 @@ BARCODE_PATTERN = re.compile(r"^\d{8,14}$")
 
 HELP_TEXT = (
     "*garmin-monitor bot*\n\n"
-    "Send any of:\n"
+    "Log meals — send any of:\n"
     "• A meal description (e.g. _\"oat porridge with banana, ~350 kcal\"_)\n"
     "• A *photo* of your food or a packaged product (Confirm/Cancel before logging)\n"
     "• A product *barcode* (8–14 digits)\n\n"
+    "Ask questions about your data:\n"
+    "• `/ask How's my protein this week?`\n"
+    "• `/ask Should I train hard today?`\n"
+    "• `/ask What did I eat yesterday?`\n\n"
     "Commands:\n"
     "/help — this message\n"
     "/today — today's calorie balance\n"
-    "/balance — alias for /today"
+    "/balance — alias for /today\n"
+    "/ask <question> — chat with your data (alias: /chat)"
+)
+
+ASK_USAGE = (
+    "Send a question after the command, e.g. \"/ask Should I train hard today?\""
 )
 
 
@@ -166,6 +175,9 @@ def _handle_text(cfg: Config, msg: dict, _pending: dict[str, dict[str, Any]]) ->
         bal = db.calorie_balance_for_date(cfg.db_path, date.today().isoformat(), cfg=cfg)
         alerts.send_telegram(cfg, _format_balance(bal))
         return
+    if text.startswith(("/ask", "/chat")):
+        _handle_ask(cfg, text)
+        return
     if BARCODE_PATTERN.match(text):
         _log_barcode_auto(cfg, text)
         return
@@ -178,6 +190,27 @@ def _handle_text(cfg: Config, msg: dict, _pending: dict[str, dict[str, Any]]) ->
     mid = db.insert_meal(cfg.db_path, meal)
     log.info("Inserted meal #%s from text", mid)
     _send_plain(cfg, f"Logged: {_format_meal_summary(meal)}")
+
+
+def _handle_ask(cfg: Config, raw: str) -> None:
+    """Strip the leading /ask or /chat command and route the rest to llm.chat."""
+    parts = raw.split(maxsplit=1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if not body:
+        _send_plain(cfg, ASK_USAGE)
+        return
+    answer = llm.chat(cfg, body)
+    if not answer:
+        _send_plain(
+            cfg,
+            "I couldn't reach Claude (check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN) "
+            "or didn't get an answer back. Try a more specific question.",
+        )
+        return
+    # Telegram caps text messages at 4096 chars; truncate defensively.
+    if len(answer) > 4000:
+        answer = answer[:4000].rstrip() + "\n\n[…truncated]"
+    _send_plain(cfg, answer)
 
 
 def _log_barcode_auto(cfg: Config, barcode: str) -> None:
