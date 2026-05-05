@@ -89,15 +89,30 @@ Retention: `daily_summary` and `alerts` are kept forever (one row per day, tiny)
 
 All frontend assets (Tailwind, Chart.js, htmx) come from CDN — no build step.
 
+### Telegram meal-logging bot
+
+`src/telegram_bot.py` runs a long-poll loop against Telegram's Bot API and dispatches inbound messages on a single chat (whitelisted via `TELEGRAM_CHAT_ID`):
+
+- **Text** → `llm.extract_meal_from_text` (Claude with `record_meal` tool forced) → `db.insert_meal` → reply.
+- **Numeric `^\d{8,14}$`** → `food.lookup_barcode` → `food.meal_from_barcode_info` → `db.insert_meal` → reply.
+- **Photo** → `getFile` → `llm.extract_meal_from_photo` (Claude vision with two tools: `record_meal` + `extract_barcode`). If a barcode is in frame, route through OFF; otherwise use the visual estimate. Either way, surface a Confirm/Cancel inline keyboard before persisting.
+- **`callback_query`** → confirm/cancel against an in-process `pending` dict.
+- **`/help`, `/today`, `/balance`** → static help / today's calorie balance.
+
+`src/llm.py` mirrors the credential-resolution pattern from `asset-management/server.js` (lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set we use the OAuth route (Bearer token + `anthropic-beta: oauth-2025-04-20` header + a system prefix identifying the request as Claude Code) so calls bill to the user's Claude Code subscription; otherwise we use the standard `ANTHROPIC_API_KEY` route. Default model `claude-sonnet-4-6`; override via `CLAUDE_MODEL`.
+
+**Photo bytes are never persisted.** The byte buffer is passed to Claude in-memory and dropped immediately; nothing is written to disk or SQLite. `tests/test_telegram_bot.py::test_photo_flow_does_not_leak_image_bytes_to_db` enforces this.
+
 ## systemd units
 
-Three units, all in `systemd/`:
+Four units, all in `systemd/`:
 
 | Unit | Type | Cadence |
 |---|---|---|
 | `garmin-poller.{service,timer}` | oneshot | every 15 min |
 | `garmin-digest.{service,timer}` | oneshot | daily 08:00 |
 | `garmin-prune.{service,timer}` | oneshot | Sundays 03:00 |
+| `garmin-bot.service` | simple, `Restart=on-failure` | always-on (optional) |
 
 Paths are hard-coded to `/home/pi/garmin-monitor`; edit `WorkingDirectory`, `EnvironmentFile`, `ExecStart`, `User` if installing under a different user.
 
@@ -109,7 +124,9 @@ Paths are hard-coded to `/home/pi/garmin-monitor`; edit `WorkingDirectory`, `Env
 - **Secrets:** never commit `.env`, the cached token dir (`~/.garminconnect/`), or the SQLite DB. All secrets via env vars.
 - **DB writes:** use the helpers in `src/db.py`. They open/close the connection per call and run with `WAL`+`synchronous=NORMAL`.
 - **Garmin rate limits:** never poll more than once per minute. Cloudflare bans propagate fast.
-- **Telegram:** `parse_mode=Markdown`. If you add reserved Markdown chars to alert text, they'll need escaping.
+- **Telegram:** `parse_mode=Markdown` for static text (alerts, help). Dynamic replies that include free-text descriptions (logged meals, balance summaries with user-supplied food names) go through `_send_plain` with no parse_mode so an asterisk in `"M&M's"` doesn't break the message.
+- **Anthropic OAuth code path** MUST send both the bearer token AND the `anthropic-beta: oauth-2025-04-20` header AND inject the "You are Claude Code, Anthropic's official CLI for Claude." system prefix as the first text block. All three are required together — drop any one and Sonnet/Opus calls fail with a misleading "credit balance" error rather than a proper auth failure. See `src/llm.py:build_anthropic_client` and `build_system_prompt`.
+- **Raw input persistence is forbidden.** Photos, audio, etc. are passed to Claude in-memory and discarded. Don't add hash caches, blob columns, or `raw_json` payloads that include base64 image data.
 
 ## Gotchas
 
@@ -118,9 +135,13 @@ Paths are hard-coded to `/home/pi/garmin-monitor`; edit `WorkingDirectory`, `Env
 - **TLS fingerprinting:** `python-garminconnect` uses `curl_cffi` to mimic a real browser. If logins start failing, `pip install --upgrade garminconnect curl_cffi` first.
 - **Daily-readiness checks need ~7 days of `daily_summary` history** before they fire — see `*_MIN_BASELINE_SAMPLES`.
 - **DB cleanup after upgrading from a BLE-era install.** This refactor dropped the `hr_realtime` and `hrv` tables. `init-db` won't drop them on existing DBs (`CREATE TABLE IF NOT EXISTS`); the operator can run `sqlite3 garmin.db 'DROP TABLE IF EXISTS hr_realtime; DROP TABLE IF EXISTS hrv; VACUUM;'` once if they want the disk reclaimed.
+- **Bot needs `requirements-bot.txt` installed.** The base install is intentionally Anthropic-free; the bot subcommand fails fast with `ModuleNotFoundError: anthropic` if you skip it.
+- **Misleading "credit balance" error** — see the Conventions entry. Rule of thumb: Haiku 4.5 succeeds without the prefix and was historically how this bug got missed; if Haiku works but Sonnet/Opus fails on the same OAuth token, suspect a missing system prefix.
 
 ## References
 
 - `python-garminconnect`: https://github.com/cyberjunky/python-garminconnect
 - Telegram Bot API: https://core.telegram.org/bots/api
 - Open Food Facts (barcode lookup): https://world.openfoodfacts.org/data
+- Anthropic Vision: https://docs.anthropic.com/claude/docs/vision
+- Anthropic Tool Use: https://docs.anthropic.com/claude/docs/tool-use

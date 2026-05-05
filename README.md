@@ -24,6 +24,27 @@ cp .env.example .env
 3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy your `chat.id`
 4. Drop both into `.env`
 
+## Telegram meal-logging bot (optional)
+
+The same Telegram bot used for alerts can also accept inbound meal logs powered by Claude. You can:
+- Send a free-text description (`"oat porridge with banana ~350 kcal"`)
+- Send a photo of your plate or a packaged product (Confirm/Cancel before logging)
+- Send a numeric barcode (8–14 digits)
+- Run `/help`, `/today`, or `/balance`
+
+```bash
+.venv/bin/pip install -r requirements-bot.txt   # adds the anthropic SDK
+```
+
+Set ONE Claude credential in `.env`:
+
+- `CLAUDE_CODE_OAUTH_TOKEN` (recommended) — get one with `claude setup-token`. Inference bills to your Claude subscription.
+- `ANTHROPIC_API_KEY` — standard pay-as-you-go API key.
+
+Optionally set `CLAUDE_MODEL` (default `claude-sonnet-4-6`).
+
+Photos are passed to Claude in-memory and discarded — nothing is written to disk or SQLite.
+
 ## Run as a service (auto-start on boot)
 
 ```bash
@@ -32,6 +53,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now garmin-poller.timer    # poll every 15 min
 sudo systemctl enable --now garmin-digest.timer    # daily 08:00 Telegram digest
 sudo systemctl enable --now garmin-prune.timer     # weekly cleanup
+sudo systemctl enable --now garmin-bot.service     # Telegram meal-logging bot (optional)
 ```
 
 ## Architecture

@@ -19,6 +19,7 @@ def _make_cfg(db_path: Path) -> Config:
         user_age=30, user_height_cm=175, user_weight_kg=75, user_sex="male",
         protein_target_g_per_kg=1.6, kcal_target=2200,
         sleep_target_hours=8, user_hrmax=0,
+        anthropic_api_key="", claude_oauth_token="", claude_model="claude-sonnet-4-6",
     )
 
 

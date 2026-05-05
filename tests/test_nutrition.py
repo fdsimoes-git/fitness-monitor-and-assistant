@@ -29,6 +29,9 @@ def _make_cfg(db_path: Path, **overrides) -> Config:
         kcal_target=2200,
         sleep_target_hours=8,
         user_hrmax=0,
+        anthropic_api_key="",
+        claude_oauth_token="",
+        claude_model="claude-sonnet-4-6",
     )
     base.update(overrides)
     return Config(**base)

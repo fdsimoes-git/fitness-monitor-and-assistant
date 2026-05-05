@@ -1,0 +1,16 @@
+[Unit]
+Description=garmin-monitor Telegram meal-logging bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/garmin-monitor
+EnvironmentFile=/home/pi/garmin-monitor/.env
+ExecStart=/home/pi/garmin-monitor/.venv/bin/python -m src.cli bot
+Restart=on-failure
+RestartSec=10
+User=pi
+
+[Install]
+WantedBy=multi-user.target
