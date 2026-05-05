@@ -255,8 +255,14 @@ def meals_for_date(db_path: Path, date_iso: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def calorie_balance_for_date(db_path: Path, date_iso: str) -> dict:
-    """Eaten kcal/macros from meals + burned kcal from activities for one local date."""
+def calorie_balance_for_date(db_path: Path, date_iso: str, cfg=None) -> dict:
+    """Eaten kcal/macros from meals + burned kcal from activities/BMR/steps for one local date.
+    
+    Args:
+        db_path: Path to SQLite database
+        date_iso: Date in YYYY-MM-DD format
+        cfg: Config object with biometric data (age, height, weight, sex). If None, only activities counted.
+    """
     meals = meals_for_date(db_path, date_iso)
     eaten = sum(m["kcal"] for m in meals if m.get("kcal") is not None)
     protein = sum(m["protein_g"] for m in meals if m.get("protein_g") is not None)
@@ -264,13 +270,36 @@ def calorie_balance_for_date(db_path: Path, date_iso: str) -> dict:
     fat = sum(m["fat_g"] for m in meals if m.get("fat_g") is not None)
 
     activities = activities_for_date(db_path, date_iso)
-    burned = sum(a["calories"] for a in activities if a.get("calories") is not None)
+    activity_burned = sum(a["calories"] for a in activities if a.get("calories") is not None)
+
+    # Calculate BMR (Mifflin-St Jeor) and step calories if config available
+    bmr_kcal = 0
+    steps_burned = 0
+    if cfg:
+        # BMR formula: for men: (10×weight) + (6.25×height) - (5×age) + 5
+        #              for women: (10×weight) + (6.25×height) - (5×age) - 161
+        if cfg.user_sex.lower() == "male":
+            bmr_kcal = (10 * cfg.user_weight_kg) + (6.25 * cfg.user_height_cm) - (5 * cfg.user_age) + 5
+        else:
+            bmr_kcal = (10 * cfg.user_weight_kg) + (6.25 * cfg.user_height_cm) - (5 * cfg.user_age) - 161
+        
+        # Get step count for the date and estimate calories (~0.048 kcal per step for 75kg person)
+        # Adjust based on actual weight: kcal_per_step = 0.048 * (weight / 75)
+        summary = daily_summary_for(db_path, date_iso)
+        if summary and summary.get("steps"):
+            kcal_per_step = 0.048 * (cfg.user_weight_kg / 75.0)
+            steps_burned = summary["steps"] * kcal_per_step
+
+    total_burned = activity_burned + bmr_kcal + steps_burned
 
     return {
         "date": date_iso,
         "eaten_kcal": round(eaten, 1) if eaten else 0.0,
-        "burned_kcal": int(burned),
-        "balance_kcal": round(eaten - burned, 1),
+        "burned_kcal": int(activity_burned),
+        "bmr_kcal": int(bmr_kcal),
+        "steps_burned_kcal": int(steps_burned),
+        "total_burned_kcal": int(total_burned),
+        "balance_kcal": round(eaten - total_burned, 1),
         "protein_g": round(protein, 1) if protein else 0.0,
         "carbs_g": round(carbs, 1) if carbs else 0.0,
         "fat_g": round(fat, 1) if fat else 0.0,

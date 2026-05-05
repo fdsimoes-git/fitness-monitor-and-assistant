@@ -411,7 +411,16 @@ def _sleep_stages_from_raw(raw_json: str | None) -> dict | None:
 
 
 def get_today_summary(db_path: Path) -> dict:
+    # Fall back to most recent day with actual data if today is empty
     today = db.daily_summary_for(db_path, _today_iso()) or {}
+    if not any(today.get(k) for k in ("resting_hr", "steps", "hrv_overnight")):
+        import sqlite3
+        con = sqlite3.connect(db_path)
+        row = con.execute(
+            "SELECT date FROM daily_summary WHERE resting_hr IS NOT NULL ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            today = db.daily_summary_for(db_path, row[0]) or {}
     yest = db.daily_summary_for(db_path, _yesterday_iso()) or {}
 
     rhr_today = _coerce_float(today.get("resting_hr"))
@@ -778,7 +787,10 @@ def _meal_time_local(meal_time: str | None) -> str:
 
 def _nutrition_row_html(balance: dict, meals: list[dict]) -> str:
     eaten = balance.get("eaten_kcal") or 0
-    burned = balance.get("burned_kcal") or 0
+    bmr = balance.get("bmr_kcal") or 0
+    steps_burned = balance.get("steps_burned_kcal") or 0
+    activity_burned = balance.get("burned_kcal") or 0
+    total_burned = balance.get("total_burned_kcal") or 0
     bal = balance.get("balance_kcal") or 0
     sign_label = "surplus" if bal >= 0 else "deficit"
     sign_color = (
@@ -786,6 +798,12 @@ def _nutrition_row_html(balance: dict, meals: list[dict]) -> str:
         else "bg-emerald-900/60 text-emerald-300"
     )
     bal_text = f"{bal:+.0f} kcal {sign_label}"
+
+    activities_row = (
+        f'<div class="flex justify-between"><span>Activities:</span>'
+        f'<span class="font-mono">{activity_burned:>5} kcal</span></div>'
+        if activity_burned > 0 else ""
+    )
 
     meals_block: str
     if not meals:
@@ -830,10 +848,17 @@ def _nutrition_row_html(balance: dict, meals: list[dict]) -> str:
       <h2 class="font-semibold text-lg">🍽️ Nutrition — Today</h2>
       <div class="grid md:grid-cols-3 gap-3">
         <div class="card">
-          <div class="stat-label">Calorie balance</div>
+          <div class="stat-label">🍽️ Calorie balance</div>
           <div class="stat-num">{eaten:.0f} <span class="text-base text-gray-400">kcal in</span></div>
-          <div class="text-xs text-gray-400">Burned (activities): {burned} kcal</div>
-          <span class="badge mt-2 {sign_color}">{bal_text}</span>
+          <div class="mt-3 text-xs text-gray-300 space-y-0.5">
+            <div class="text-gray-400 uppercase tracking-wide text-[0.65rem]">Burned</div>
+            <div class="flex justify-between"><span>BMR:</span><span class="font-mono">{bmr:>5} kcal</span></div>
+            <div class="flex justify-between"><span>Steps:</span><span class="font-mono">{steps_burned:>5} kcal</span></div>
+            {activities_row}
+            <div class="border-t border-gray-700 my-1"></div>
+            <div class="flex justify-between font-semibold"><span>Total:</span><span class="font-mono">{total_burned:>5} kcal</span></div>
+          </div>
+          <span class="badge mt-3 {sign_color}">{bal_text}</span>
         </div>
         <div class="card">
           <h3 class="font-semibold mb-2 text-sm">Macros</h3>
@@ -911,7 +936,7 @@ def render_full(cfg: Config) -> str:
 
     today_iso = _today_iso()
     today_meals = db.meals_for_date(cfg.db_path, today_iso)
-    today_balance = db.calorie_balance_for_date(cfg.db_path, today_iso)
+    today_balance = db.calorie_balance_for_date(cfg.db_path, today_iso, cfg=cfg)
 
     return "\n".join(
         [
@@ -974,7 +999,7 @@ def create_app(cfg: Config) -> "FastAPI":
     @app.get("/api/calorie-balance")
     def api_calorie_balance(date: str | None = None) -> JSONResponse:
         target = date or _today_iso()
-        return JSONResponse(db.calorie_balance_for_date(cfg.db_path, target))
+        return JSONResponse(db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg))
 
     return app
 

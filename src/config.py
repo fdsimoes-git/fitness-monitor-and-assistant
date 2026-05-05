@@ -43,6 +43,12 @@ class Config:
     # Logging
     log_level: str
 
+    # Biometrics (for calorie calculations)
+    user_age: int
+    user_height_cm: int
+    user_weight_kg: int
+    user_sex: str  # 'male' or 'female'
+
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
@@ -57,6 +63,10 @@ class Config:
             alert_cooldown_seconds=int(_get("ALERT_COOLDOWN_SECONDS", "300")),
             poll_interval_minutes=int(_get("POLL_INTERVAL_MINUTES", "15")),
             log_level=_get("LOG_LEVEL", "INFO"),
+            user_age=int(_get("USER_AGE", "30")),
+            user_height_cm=int(_get("USER_HEIGHT_CM", "175")),
+            user_weight_kg=int(_get("USER_WEIGHT_KG", "75")),
+            user_sex=_get("USER_SEX", "male"),
         )
 
 

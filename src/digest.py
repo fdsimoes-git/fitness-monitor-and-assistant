@@ -106,18 +106,38 @@ def build_digest(cfg: Config, target_date: date | None = None) -> str | None:
         for a in activities:
             lines.append(_format_activity_line(a))
 
-    balance = db.calorie_balance_for_date(cfg.db_path, target_date.isoformat())
+    balance = db.calorie_balance_for_date(cfg.db_path, target_date.isoformat(), cfg=cfg)
     if balance.get("meal_count", 0) > 0:
         bal_kcal = balance["balance_kcal"]
         sign = "surplus" if bal_kcal >= 0 else "deficit"
         lines.append("")
         lines.append(
-            f"🍽️ Nutrition: ate {balance['eaten_kcal']:.0f}kcal, "
-            f"burned {balance['burned_kcal']}kcal (activities) → "
-            f"{bal_kcal:+.0f}kcal {sign}"
+            f"🍽️ *Nutrition Summary*"
         )
         lines.append(
-            f"💪 Macros: {balance['protein_g']:.0f}g protein / "
+            f"Intake: {balance['eaten_kcal']:.0f}kcal"
+        )
+        lines.append(
+            f"\nExpenditure breakdown:"
+        )
+        lines.append(
+            f"  • BMR (basal metabolic rate): {balance['bmr_kcal']}kcal"
+        )
+        lines.append(
+            f"  • Steps: {balance['steps_burned_kcal']}kcal"
+        )
+        if balance['burned_kcal'] > 0:
+            lines.append(
+                f"  • Activities: {balance['burned_kcal']}kcal"
+            )
+        lines.append(
+            f"  *Total burned: {balance['total_burned_kcal']}kcal*"
+        )
+        lines.append(
+            f"\n*Balance: {bal_kcal:+.0f}kcal {sign}*"
+        )
+        lines.append(
+            f"\n💪 Macros: {balance['protein_g']:.0f}g protein / "
             f"{balance['carbs_g']:.0f}g carbs / {balance['fat_g']:.0f}g fat"
         )
     return "\n".join(lines)

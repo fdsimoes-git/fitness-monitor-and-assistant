@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
             kcal = r.get("kcal")
             kcal_str = f"{kcal:>5.0f}" if kcal is not None else "    —"
             print(f"  {t}  {kcal_str} kcal  {r.get('description')}")
-        bal = db.calorie_balance_for_date(cfg.db_path, target)
+        bal = db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg)
         print(
             f"\nTotals: {bal['eaten_kcal']:.0f} kcal · "
             f"P{bal['protein_g']:.0f}g / C{bal['carbs_g']:.0f}g / F{bal['fat_g']:.0f}g"
@@ -209,15 +209,21 @@ def main(argv: list[str] | None = None) -> int:
         from datetime import date as date_cls
         from . import db
         target = args.date or date_cls.today().isoformat()
-        bal = db.calorie_balance_for_date(cfg.db_path, target)
+        bal = db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg)
         sign = "surplus" if bal["balance_kcal"] >= 0 else "deficit"
         print(
-            f"Calorie balance — {target}\n"
-            f"  Eaten:   {bal['eaten_kcal']:>6.0f} kcal ({bal['meal_count']} meals)\n"
-            f"  Burned:  {bal['burned_kcal']:>6} kcal (activities)\n"
-            f"  Balance: {bal['balance_kcal']:>+6.0f} kcal ({sign})\n"
-            f"  Macros:  P{bal['protein_g']:.0f}g / C{bal['carbs_g']:.0f}g / F{bal['fat_g']:.0f}g"
+            f"Calorie balance — {target}"
         )
+        print(f"  Eaten:      {bal['eaten_kcal']:>6.0f} kcal ({bal['meal_count']} meals)")
+        print(f"\n  Burned breakdown:")
+        print(f"    • BMR:       {bal['bmr_kcal']:>6} kcal")
+        print(f"    • Steps:     {bal['steps_burned_kcal']:>6} kcal")
+        if bal['burned_kcal'] > 0:
+            print(f"    • Activities:{bal['burned_kcal']:>6} kcal")
+        print(f"    ────────────────────")
+        print(f"    • Total:     {bal['total_burned_kcal']:>6} kcal")
+        print(f"\n  Balance:    {bal['balance_kcal']:>+6.0f} kcal ({sign})")
+        print(f"  Macros:     P{bal['protein_g']:.0f}g / C{bal['carbs_g']:.0f}g / F{bal['fat_g']:.0f}g")
         return 0
 
     return 2

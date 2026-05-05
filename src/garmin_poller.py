@@ -19,8 +19,13 @@ from .smart_alerts import run_smart_alerts
 log = logging.getLogger(__name__)
 
 
+def _prompt_mfa() -> str:
+    """Read MFA code from stdin (used on first login)."""
+    return input("Garmin MFA code: ").strip()
+
+
 def _login(cfg: Config) -> Garmin:
-    client = Garmin(cfg.garmin_email, cfg.garmin_password)
+    client = Garmin(cfg.garmin_email, cfg.garmin_password, prompt_mfa=_prompt_mfa)
     # The library auto-creates and refreshes tokens in the token dir
     client.login(str(cfg.garmin_token_dir))
     return client
