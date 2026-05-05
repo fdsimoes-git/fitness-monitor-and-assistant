@@ -92,6 +92,23 @@ def test_build_client_raises_without_credentials():
         llm.build_anthropic_client(llm.AnthropicAuth(auth_token="", api_key=""))
 
 
+def test_build_client_translates_missing_sdk_to_actionable_error():
+    """If `anthropic` isn't installed, surface a runtime error pointing at requirements-bot.txt
+    rather than the raw ModuleNotFoundError stack trace."""
+    auth = llm.AnthropicAuth(auth_token="", api_key="sk-ant-api03-x")
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "anthropic":
+            raise ModuleNotFoundError("No module named 'anthropic'")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=fake_import), \
+         pytest.raises(RuntimeError, match="requirements-bot.txt"):
+        llm.build_anthropic_client(auth)
+
+
 # ── build_system_prompt ─────────────────────────────────────────────────────
 
 

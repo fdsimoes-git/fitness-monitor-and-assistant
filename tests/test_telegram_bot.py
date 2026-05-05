@@ -356,6 +356,22 @@ def test_callback_cancel_drops_pending_without_insert(tmpdb):
     assert "Cancelled" in mock_edit.call_args.args[3]
 
 
+def test_callback_unknown_action_does_not_drop_pending_entry(tmpdb):
+    """Bad/unknown callback data must not silently consume a still-valid pending proposal."""
+    cfg = _make_cfg(tmpdb)
+    pending = {"abc123": {"meal": {"description": "hummus", "kcal": 250},
+                          "ts": time.time()}}
+    with patch("src.telegram_bot._answer_callback") as mock_ack, \
+         patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit, \
+         patch("src.telegram_bot.db.insert_meal") as mock_insert:
+        telegram_bot.dispatch(cfg, _callback("foo:abc123"), pending)
+    # Action was unknown — entry must still be pending so the user can retry.
+    assert pending["abc123"]["meal"]["description"] == "hummus"
+    mock_insert.assert_not_called()
+    mock_edit.assert_not_called()
+    assert mock_ack.call_args.args[2] == "Unknown action"
+
+
 def test_callback_expired_pending_replies_gracefully(tmpdb):
     cfg = _make_cfg(tmpdb)
     with patch("src.telegram_bot._answer_callback") as mock_ack, \

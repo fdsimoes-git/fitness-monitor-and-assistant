@@ -296,11 +296,18 @@ def _handle_callback(
         _answer_callback(cfg, callback_id, "Bad callback")
         return
     action, pid = data.split(":", 1)
-    entry = pending.pop(pid, None)
     msg = q.get("message") or {}
     chat_id = msg.get("chat", {}).get("id")
     msg_id = msg.get("message_id")
 
+    # Validate the action BEFORE touching the pending dict so a bad/unknown
+    # callback doesn't silently consume a still-pending proposal.
+    if action not in ("confirm", "cancel"):
+        log.warning("Ignoring unknown callback action %r for pid=%s", action, pid)
+        _answer_callback(cfg, callback_id, "Unknown action")
+        return
+
+    entry = pending.pop(pid, None)
     if entry is None:
         _answer_callback(cfg, callback_id, "Expired")
         if chat_id and msg_id:
@@ -315,12 +322,10 @@ def _handle_callback(
             _edit_message_remove_keyboard(
                 cfg, chat_id, msg_id, f"✅ Logged: {_format_meal_summary(meal)}"
             )
-    elif action == "cancel":
+    else:  # cancel
         _answer_callback(cfg, callback_id, "Cancelled")
         if chat_id and msg_id:
             _edit_message_remove_keyboard(cfg, chat_id, msg_id, "❌ Cancelled.")
-    else:
-        _answer_callback(cfg, callback_id, "Unknown action")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

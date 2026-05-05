@@ -74,8 +74,19 @@ def resolve_anthropic_auth(cfg: Config) -> AnthropicAuth:
 def build_anthropic_client(auth: AnthropicAuth):
     """Construct an Anthropic SDK client. Imports the SDK lazily so the rest of
     the project doesn't pay the import cost when the bot isn't installed.
+
+    Raises a clear `RuntimeError` (rather than the raw `ModuleNotFoundError`)
+    when the SDK isn't on the path — directs the operator to the
+    `requirements-bot.txt` install step.
     """
-    import anthropic  # local import — anthropic is in requirements-bot.txt only
+    try:
+        import anthropic  # in requirements-bot.txt only
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "anthropic SDK is not installed. The Telegram bot and `log-meal-ai` "
+            "subcommand require it. Install with:\n"
+            "    .venv/bin/pip install -r requirements-bot.txt"
+        ) from e
 
     if auth.auth_token:
         return anthropic.Anthropic(
