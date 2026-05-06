@@ -453,6 +453,48 @@ def test_edit_meal_tool_requires_at_least_one_field(tmpdb_cfg):
     assert pending == {}
 
 
+def test_edit_meal_tool_filters_to_editable_columns(tmpdb_cfg):
+    """Only columns in db.EDITABLE_MEAL_COLUMNS make it into pending — the
+    proposal must not claim to edit fields the DB layer would silently drop."""
+    from src import db as _db
+    mid = _db.insert_meal(tmpdb_cfg.db_path, {"description": "salmon", "source": "manual", "kcal": 400})
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool(
+        "edit_meal",
+        {
+            "meal_id": mid,
+            "kcal": 380,                    # editable
+            "description": "salmon (corrected)",  # editable
+            "source": "ai",                 # NOT editable — should be dropped
+            "raw_json": "{ \"x\": 1 }",     # NOT editable — should be dropped
+            "id": 9999,                     # NOT editable — should be dropped
+        },
+        tmpdb_cfg, pending,
+    )
+    assert "pending_id" in out
+    pid = out["pending_id"]
+    fields = pending[pid]["fields"]
+    assert set(fields) == {"kcal", "description"}
+    assert fields["kcal"] == 380
+
+
+def test_edit_meal_tool_errors_when_only_non_editable_fields_supplied(tmpdb_cfg):
+    """If the model sends nothing the DB will accept, surface a clear error
+    instead of stashing an empty proposal that confirm would then fail on."""
+    from src import db as _db
+    mid = _db.insert_meal(tmpdb_cfg.db_path, {"description": "x", "source": "manual", "kcal": 100})
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool(
+        "edit_meal",
+        {"meal_id": mid, "source": "ai", "raw_json": "{}", "id": 9999},
+        tmpdb_cfg, pending,
+    )
+    assert "error" in out
+    # Error names the allowed set so the model can correct on retry.
+    assert "kcal" in out["error"]
+    assert pending == {}
+
+
 def test_delete_meal_tool_parks_delete_with_before_snapshot(tmpdb_cfg):
     from src import db as _db
     mid = _db.insert_meal(tmpdb_cfg.db_path, {"description": "snack", "source": "manual", "kcal": 200})

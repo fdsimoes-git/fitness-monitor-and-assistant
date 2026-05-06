@@ -613,9 +613,22 @@ def _execute_chat_tool(
         before = db.get_meal_by_id(cfg.db_path, meal_id)
         if before is None:
             return {"error": f"Meal #{meal_id} not found."}
-        fields = {k: v for k, v in input_data.items() if k != "meal_id"}
+        # Filter to columns the DB actually allows mutating BEFORE stashing.
+        # Without this, `db.update_meal` silently drops anything outside
+        # `EDITABLE_MEAL_COLUMNS` and the proposal lies about what it'll do —
+        # then update_meal returns False and the user sees a misleading
+        # "no matching row" failure.
+        fields = {
+            k: v for k, v in input_data.items()
+            if k != "meal_id" and k in db.EDITABLE_MEAL_COLUMNS
+        }
         if not fields:
-            return {"error": "edit_meal requires at least one field to change"}
+            return {
+                "error": (
+                    "edit_meal requires at least one editable field. Allowed: "
+                    + ", ".join(sorted(db.EDITABLE_MEAL_COLUMNS))
+                )
+            }
         return _stash_pending(
             pending, action="edit", meal_id=meal_id, fields=fields, before=before,
         )

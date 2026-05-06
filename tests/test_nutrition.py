@@ -194,7 +194,7 @@ def test_update_meal_applies_partial_fields(tmpdb):
 def test_update_meal_drops_unknown_columns(tmpdb):
     """Unknown keys must be silently ignored — the tool layer is the validator."""
     mid = db.insert_meal(tmpdb, {"description": "salmon", "source": "manual", "kcal": 400})
-    # `id` and `source` aren't in _EDITABLE_MEAL_COLUMNS — should not change.
+    # `id` and `source` aren't in EDITABLE_MEAL_COLUMNS — should not change.
     db.update_meal(tmpdb, mid, {"id": 9999, "source": "evil", "kcal": 350})
     after = db.get_meal_by_id(tmpdb, mid)
     assert after["id"] == mid

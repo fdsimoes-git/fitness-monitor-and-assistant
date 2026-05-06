@@ -254,7 +254,10 @@ def get_meal_by_id(db_path: Path, meal_id: int) -> dict | None:
 
 
 # Columns on `meals` that the chat-driven edit tool is allowed to mutate.
-_EDITABLE_MEAL_COLUMNS = {
+# Public so the LLM tool dispatcher can filter against the same set BEFORE
+# stashing a proposal — otherwise the proposal can claim it'll edit fields
+# (source, raw_json, …) that update_meal then silently drops.
+EDITABLE_MEAL_COLUMNS = {
     "description", "kcal", "protein_g", "carbs_g", "fat_g",
     "fiber_g", "sugars_g", "saturated_fat_g", "sodium_mg",
     "food_category", "meal_time",
@@ -262,13 +265,13 @@ _EDITABLE_MEAL_COLUMNS = {
 
 
 def update_meal(db_path: Path, meal_id: int, fields: dict) -> bool:
-    """Partial update of a meal row. Only columns in `_EDITABLE_MEAL_COLUMNS` are
+    """Partial update of a meal row. Only columns in `EDITABLE_MEAL_COLUMNS` are
     applied; unknown keys are silently dropped (the tool layer is the validator).
 
     Returns True if a row was updated, False if no row matched the id or no
     valid fields were supplied.
     """
-    payload = {k: v for k, v in (fields or {}).items() if k in _EDITABLE_MEAL_COLUMNS}
+    payload = {k: v for k, v in (fields or {}).items() if k in EDITABLE_MEAL_COLUMNS}
     if not payload:
         return False
     set_sql = ", ".join(f"{k} = :{k}" for k in payload)
