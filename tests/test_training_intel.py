@@ -29,6 +29,9 @@ def _make_cfg(db_path: Path, **overrides) -> Config:
         kcal_target=2200,
         sleep_target_hours=8,
         user_hrmax=0,
+        anthropic_api_key="",
+        claude_oauth_token="",
+        claude_model="claude-sonnet-4-6",
     )
     base.update(overrides)
     return Config(**base)
@@ -265,5 +268,7 @@ def test_daily_readiness_history_returns_one_per_day(tmpdb):
     cfg = _make_cfg(tmpdb)
     out = db.daily_readiness_history(tmpdb, days=7, cfg=cfg)
     assert len(out) == 7
+    # Production now anchors on Pi-local 'today' (db.local_today), so this
+    # plain `date.today()` matches and is no longer UTC-flaky.
     today = date.today().isoformat()
     assert out[-1]["date"] == today

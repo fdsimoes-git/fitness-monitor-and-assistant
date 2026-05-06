@@ -79,3 +79,44 @@ def lookup_barcode(barcode: str) -> dict | None:
         "serving_size_g": serving_g,
         "raw": product,
     }
+
+
+def meal_from_barcode_info(
+    info: dict, barcode: str, grams: float | None = None
+) -> dict:
+    """Scale Open Food Facts per-100g values to a serving and return a meal dict
+    suitable for `db.insert_meal`. Falls back to the API's serving size, then 100g.
+
+    Used by both the CLI `log-barcode` subcommand and the Telegram bot's
+    barcode flow so the scaling math stays identical.
+    """
+    # Coerce to float defensively — the chat dispatcher's lookup_barcode tool
+    # passes whatever the model produced, which can be a string ("100"), an
+    # int, or a float. Without this, `factor = grams / 100.0` would crash on
+    # str input and a barcode tool call with a stringly-typed `grams` would
+    # fail mid-loop.
+    if grams is None:
+        grams = info.get("serving_size_g") or 100.0
+    try:
+        grams = float(grams)
+    except (TypeError, ValueError):
+        grams = float(info.get("serving_size_g") or 100.0)
+    factor = grams / 100.0
+
+    def _scale(per100: float | None) -> float | None:
+        return round(per100 * factor, 1) if per100 is not None else None
+
+    return {
+        "description": f"{info['name']} ({grams:.0f}g)",
+        "source": "barcode",
+        "barcode": barcode,
+        "kcal": _scale(info.get("kcal_100g")),
+        "protein_g": _scale(info.get("protein_100g")),
+        "carbs_g": _scale(info.get("carbs_100g")),
+        "fat_g": _scale(info.get("fat_100g")),
+        "fiber_g": _scale(info.get("fiber_100g")),
+        "sugars_g": _scale(info.get("sugars_100g")),
+        "saturated_fat_g": _scale(info.get("saturated_fat_100g")),
+        "sodium_mg": _scale(info.get("sodium_mg_100g")),
+        "food_category": info.get("food_category"),
+    }

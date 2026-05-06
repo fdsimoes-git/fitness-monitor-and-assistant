@@ -24,6 +24,36 @@ cp .env.example .env
 3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy your `chat.id`
 4. Drop both into `.env`
 
+## Telegram fitness/nutrition assistant (optional)
+
+The Telegram bot is now a chat-first health assistant — modelled after the financial advisor in `asset-management/server.js`. Just chat with it; the assistant decides whether to query your data or propose a write to your meal log. Every meal insert / edit / delete shows a Confirm/Cancel button before anything touches the DB.
+
+Things you can say:
+- `oat porridge with banana, ~350 kcal` — proposes a log
+- send a photo of your food or a packaged product — visual estimate or barcode lookup
+- `5449000000996` — bare barcode → Open Food Facts lookup → propose log
+- `delete the snack from yesterday`
+- `change meal 12 to 250 kcal`
+- `how's my protein this week?`
+- `should I train hard today?`
+- `what did I eat yesterday?`
+
+Fast-path commands (no Claude call):
+- `/help`, `/today`, `/balance`
+
+```bash
+.venv/bin/pip install -r requirements-bot.txt   # adds the anthropic SDK
+```
+
+Set ONE Claude credential in `.env`:
+
+- `CLAUDE_CODE_OAUTH_TOKEN` (recommended) — get one with `claude setup-token`. Inference bills to your Claude subscription.
+- `ANTHROPIC_API_KEY` — standard pay-as-you-go API key.
+
+Optionally set `CLAUDE_MODEL` (default `claude-sonnet-4-6`).
+
+Photos are passed to Claude in-memory and discarded — nothing is written to disk or SQLite.
+
 ## Run as a service (auto-start on boot)
 
 ```bash
@@ -32,6 +62,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now garmin-poller.timer    # poll every 15 min
 sudo systemctl enable --now garmin-digest.timer    # daily 08:00 Telegram digest
 sudo systemctl enable --now garmin-prune.timer     # weekly cleanup
+sudo systemctl enable --now garmin-bot.service     # Telegram meal-logging bot (optional)
 ```
 
 ## Architecture

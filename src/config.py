@@ -54,6 +54,13 @@ class Config:
     sleep_target_hours: float
     user_hrmax: int  # 0 → fall back to 220 - age
 
+    # Claude (for the Telegram meal-logging bot). Set ONE of these — the
+    # OAuth token route bills calls to the user's Claude Code subscription;
+    # the API key route bills the workspace's pay-as-you-go credits.
+    anthropic_api_key: str
+    claude_oauth_token: str
+    claude_model: str
+
     @classmethod
     def from_env(cls) -> "Config":
         age = int(_get("USER_AGE", "30"))
@@ -76,6 +83,9 @@ class Config:
             kcal_target=int(_get("KCAL_TARGET", "2200")),
             sleep_target_hours=float(_get("SLEEP_TARGET_HOURS", "8")),
             user_hrmax=int(_get("USER_HRMAX", "0")),
+            anthropic_api_key=_get("ANTHROPIC_API_KEY"),
+            claude_oauth_token=_get("CLAUDE_CODE_OAUTH_TOKEN"),
+            claude_model=_get("CLAUDE_MODEL", "claude-sonnet-4-6"),
         )
 
 

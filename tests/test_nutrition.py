@@ -29,6 +29,9 @@ def _make_cfg(db_path: Path, **overrides) -> Config:
         kcal_target=2200,
         sleep_target_hours=8,
         user_hrmax=0,
+        anthropic_api_key="",
+        claude_oauth_token="",
+        claude_model="claude-sonnet-4-6",
     )
     base.update(overrides)
     return Config(**base)
@@ -40,6 +43,34 @@ def tmpdb():
         p = Path(d) / "t.db"
         db.init_db(p)
         yield p
+
+
+def test_meal_from_barcode_info_coerces_string_grams():
+    """`meal_from_barcode_info` is reached via the chat lookup_barcode tool
+    where the model may pass grams as a string. The helper must coerce
+    rather than crash on `factor = grams / 100.0`."""
+    from src import food
+    info = {
+        "name": "Test Bar", "kcal_100g": 400, "protein_100g": 5, "carbs_100g": 60,
+        "fat_100g": 14, "fiber_100g": 3, "sugars_100g": 35, "saturated_fat_100g": 8,
+        "sodium_mg_100g": 80, "food_category": "Sugary snacks", "serving_size_g": 50,
+    }
+    out = food.meal_from_barcode_info(info, "1234567890123", grams="30")
+    assert out["kcal"] == 120  # 400 * 0.3
+    assert out["description"] == "Test Bar (30g)"
+
+
+def test_meal_from_barcode_info_falls_back_when_grams_unparseable():
+    """A non-numeric grams (e.g. None-of-the-above gibberish) falls back to
+    the API's serving_size_g rather than raising."""
+    from src import food
+    info = {
+        "name": "X", "kcal_100g": 100, "protein_100g": 1, "carbs_100g": 10, "fat_100g": 1,
+        "fiber_100g": None, "sugars_100g": None, "saturated_fat_100g": None,
+        "sodium_mg_100g": None, "food_category": None, "serving_size_g": 50,
+    }
+    out = food.meal_from_barcode_info(info, "1", grams="not-a-number")
+    assert out["kcal"] == 50  # 100 * 0.5 (fell back to 50g serving)
 
 
 def test_protein_target_scales_with_weight(tmpdb):
@@ -122,6 +153,124 @@ def test_whole_food_pct_unknown_category_counts_as_whole(tmpdb):
     assert db.whole_food_pct(tmpdb, today) == 1.0
 
 
+def test_meal_timing_summary_handles_naive_iso_meal_times(tmpdb):
+    """Regression for the dashboard HTTP-500 caused by Claude returning
+    tz-less meal_time strings. meal_timing_summary used to subtract a
+    UTC-aware now() from a naive fromisoformat() result and raise
+    TypeError. Now naive ISOs are treated as local, normalized, and the
+    subtraction is safe."""
+    today = date.today()
+    today_iso = today.isoformat()
+    # Insert two meals via raw SQL so we keep the tz-less shape (insert_meal
+    # would normalize them on the way in — that's the other half of the fix).
+    import sqlite3
+    naive_breakfast = f"{today_iso}T08:00:00"
+    naive_dinner = f"{today_iso}T19:30:00"
+    now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with sqlite3.connect(tmpdb) as conn:
+        for naive in (naive_breakfast, naive_dinner):
+            conn.execute(
+                "INSERT INTO meals (logged_at, meal_time, description, source, kcal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (now_utc, naive, "x", "manual", 100),
+            )
+        conn.commit()
+    # Should not raise.
+    out = db.meal_timing_summary(tmpdb, today_iso)
+    assert out is not None
+    assert out["meal_count"] == 2
+    assert out["eating_window_h"] > 0
+    assert "hours_since_last_meal" in out
+
+
+def test_iso_to_utc_aware_handles_z_suffix():
+    """fromisoformat in Python <3.11 doesn't accept 'Z'; the helper must
+    pre-normalize so a valid UTC `Z` ISO doesn't fall through to the
+    insert_meal exception path and get clobbered by `now`."""
+    # `Z` in must round-trip to `+00:00` UTC out.
+    out = db._iso_to_utc_aware("2026-05-06T13:28:00Z")
+    assert out.tzinfo is not None
+    assert out.utcoffset().total_seconds() == 0
+    assert out.isoformat() == "2026-05-06T13:28:00+00:00"
+
+
+def test_iso_to_utc_aware_handles_explicit_tz():
+    """Sanity: tz-aware input with `+HH:MM` still parses correctly."""
+    out = db._iso_to_utc_aware("2026-05-06T10:28:00-03:00")
+    # Brazil 10:28 → UTC 13:28
+    assert out.isoformat() == "2026-05-06T13:28:00+00:00"
+
+
+def test_update_meal_normalizes_meal_time(tmpdb):
+    """update_meal must apply the same UTC-ISO invariant as insert_meal."""
+    mid = db.insert_meal(tmpdb, {"description": "lunch", "source": "manual", "kcal": 500})
+    naive = "2026-05-06T13:28:00"
+    assert db.update_meal(tmpdb, mid, {"meal_time": naive}) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    # Stored value carries a tz suffix.
+    assert after["meal_time"].endswith("+00:00") or "+" in after["meal_time"][10:]
+    # And it round-trips through fromisoformat as tz-aware.
+    parsed = datetime.fromisoformat(after["meal_time"])
+    assert parsed.tzinfo is not None
+
+
+def test_update_meal_drops_unparseable_meal_time(tmpdb):
+    """Garbage meal_time → drop the field rather than raise or store junk."""
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    before_meal_time = db.get_meal_by_id(tmpdb, mid)["meal_time"]
+    # `kcal` is valid; `meal_time` is gibberish — kcal should still apply.
+    assert db.update_meal(tmpdb, mid, {"kcal": 200, "meal_time": "not-a-date"}) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["kcal"] == 200
+    assert after["meal_time"] == before_meal_time  # untouched
+
+
+def test_update_meal_drops_none_for_not_null_columns(tmpdb):
+    """description and meal_time are NOT NULL — None/empty must be dropped from
+    the payload rather than triggering sqlite3.IntegrityError."""
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    # Mix valid (kcal) + invalid (description=None, meal_time="").
+    assert db.update_meal(tmpdb, mid, {
+        "kcal": 250,
+        "description": None,
+        "meal_time": "   ",
+    }) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["kcal"] == 250
+    assert after["description"] == "x"  # untouched, not nulled
+
+
+def test_update_meal_returns_false_when_only_invalid_fields(tmpdb):
+    """All-invalid payload (NOT NULL violations + bad timestamps) → False, no UPDATE."""
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    assert db.update_meal(tmpdb, mid, {
+        "description": None,
+        "meal_time": None,
+    }) is False
+
+
+def test_insert_meal_normalizes_naive_meal_time_to_utc(tmpdb):
+    """Defense in depth: when Claude tool input comes in with a tz-less ISO,
+    insert_meal normalizes to a UTC-aware ISO with a tz suffix so the column
+    is always consistent going forward."""
+    naive = "2026-05-06T13:28:00"
+    db.insert_meal(tmpdb, {
+        "description": "lunch",
+        "source": "ai",
+        "kcal": 600,
+        "meal_time": naive,
+    })
+    import sqlite3
+    with sqlite3.connect(tmpdb) as conn:
+        rows = conn.execute("SELECT meal_time FROM meals ORDER BY id DESC LIMIT 1").fetchall()
+    stored = rows[0][0]
+    # Stored value carries a tz suffix — either "+HH:MM" or "Z".
+    assert stored.endswith(("+00:00", "Z")) or "+" in stored[10:] or "-" in stored[10:]
+    # And it round-trips through the ISO parser as a tz-aware datetime.
+    parsed = datetime.fromisoformat(stored)
+    assert parsed.tzinfo is not None
+
+
 def test_meal_timing_summary_returns_none_when_empty(tmpdb):
     assert db.meal_timing_summary(tmpdb, date.today().isoformat()) is None
 
@@ -150,7 +299,9 @@ def test_meal_timing_summary_computes_window_and_count(tmpdb):
 
 def test_recent_calorie_balance_returns_one_row_per_day(tmpdb):
     cfg = _make_cfg(tmpdb)
-    today = datetime.now(timezone.utc).date()
+    # Production anchors on Pi-local 'today' (db.local_today). Match here
+    # so this test isn't UTC-flaky around midnight.
+    today = date.today()
     db.insert_meal(tmpdb, {"description": "today's lunch", "source": "manual", "kcal": 600.0})
     out = db.recent_calorie_balance(tmpdb, days=7, cfg=cfg)
     assert len(out) == 7
@@ -158,6 +309,101 @@ def test_recent_calorie_balance_returns_one_row_per_day(tmpdb):
     assert out[-1]["date"] == today.isoformat()
     # Today should have a non-zero negative balance (we ate 600, burned via BMR>>that)
     assert out[-1]["balance_kcal"] < 0
+
+
+def test_get_meal_by_id_round_trip(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "salmon", "source": "manual", "kcal": 400})
+    got = db.get_meal_by_id(tmpdb, mid)
+    assert got is not None
+    assert got["id"] == mid
+    assert got["description"] == "salmon"
+    assert got["kcal"] == 400
+
+
+def test_get_meal_by_id_returns_none_for_missing():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "t.db"
+        db.init_db(p)
+        assert db.get_meal_by_id(p, 99999) is None
+
+
+def test_update_meal_applies_partial_fields(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "salmon", "source": "manual", "kcal": 400, "protein_g": 30})
+    assert db.update_meal(tmpdb, mid, {"kcal": 380, "protein_g": 32}) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["kcal"] == 380
+    assert after["protein_g"] == 32
+    assert after["description"] == "salmon"  # untouched
+
+
+def test_update_meal_drops_unknown_columns(tmpdb):
+    """Unknown keys must be silently ignored — the tool layer is the validator."""
+    mid = db.insert_meal(tmpdb, {"description": "salmon", "source": "manual", "kcal": 400})
+    # `id` and `source` aren't in EDITABLE_MEAL_COLUMNS — should not change.
+    db.update_meal(tmpdb, mid, {"id": 9999, "source": "evil", "kcal": 350})
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["id"] == mid
+    assert after["source"] == "manual"
+    assert after["kcal"] == 350
+
+
+def test_update_meal_returns_false_when_no_valid_fields(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    assert db.update_meal(tmpdb, mid, {"id": 1, "source": "y"}) is False
+
+
+def test_update_meal_returns_false_for_missing_row(tmpdb):
+    assert db.update_meal(tmpdb, 99999, {"kcal": 100}) is False
+
+
+def test_delete_meal_removes_row(tmpdb):
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    assert db.delete_meal(tmpdb, mid) is True
+    assert db.get_meal_by_id(tmpdb, mid) is None
+
+
+def test_delete_meal_returns_false_for_missing(tmpdb):
+    assert db.delete_meal(tmpdb, 99999) is False
+
+
+def testlocal_today_helper_returns_local_date():
+    """Sanity: local_today() agrees with date.today() right now."""
+    assert db.local_today() == date.today()
+
+
+def test_recent_calorie_balance_anchors_onlocal_today(tmpdb):
+    """Last entry in the 7-day balance series must be local today, not UTC."""
+    from unittest.mock import patch
+    cfg = _make_cfg(tmpdb)
+    fake_today = date(2026, 5, 5)  # local
+    with patch("src.db.local_today", return_value=fake_today):
+        out = db.recent_calorie_balance(tmpdb, days=7, cfg=cfg)
+    assert out[-1]["date"] == "2026-05-05"
+    assert out[0]["date"] == "2026-04-29"
+
+
+def test_daily_readiness_history_anchors_onlocal_today(tmpdb):
+    from unittest.mock import patch
+    cfg = _make_cfg(tmpdb)
+    fake_today = date(2026, 5, 5)
+    with patch("src.db.local_today", return_value=fake_today):
+        out = db.daily_readiness_history(tmpdb, days=3, cfg=cfg)
+    assert [r["date"] for r in out] == ["2026-05-03", "2026-05-04", "2026-05-05"]
+
+
+def test_recent_activities_cutoff_useslocal_today(tmpdb):
+    """An activity dated as Pi-local 2026-05-05 must be findable when
+    queried at local 2026-05-05, even when UTC has rolled over to 05-06."""
+    from unittest.mock import patch
+    db.upsert_activity(tmpdb, {
+        "activity_id": "a1", "date": "2026-05-05", "activity_type": "running",
+        "name": "easy run", "duration_s": 1800, "distance_m": 4000,
+        "avg_hr": 130, "max_hr": 150, "calories": 300, "training_effect": 2.5,
+    })
+    with patch("src.db.local_today", return_value=date(2026, 5, 5)):
+        out = db.recent_activities(tmpdb, days=1)
+    assert any(a["activity_id"] == "a1" for a in out)
 
 
 def test_meals_persist_new_columns(tmpdb):

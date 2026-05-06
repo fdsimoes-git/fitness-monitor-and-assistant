@@ -30,6 +30,12 @@ def main(argv: list[str] | None = None) -> int:
     dash_p = sub.add_parser("dashboard", help="Run the FastAPI dashboard (optional)")
     dash_p.add_argument("--host", default="127.0.0.1")
     dash_p.add_argument("--port", type=int, default=8000)
+    sub.add_parser("bot", help="Start the Telegram meal-logging bot (long-running)")
+    log_ai_p = sub.add_parser(
+        "log-meal-ai", help="Use Claude to extract a meal from a free-text description and log it"
+    )
+    log_ai_p.add_argument("--desc", required=True, help="Free-text meal description")
+    log_ai_p.add_argument("--meal-time", help="ISO timestamp (defaults to now)")
     prune_p = sub.add_parser("prune", help="Delete old activities/meals rows and VACUUM")
     prune_p.add_argument("--days", type=int, default=90, help="Retention window in days (default 90)")
     act_p = sub.add_parser("activities", help="Print recent activities from the DB")
@@ -96,6 +102,27 @@ def main(argv: list[str] | None = None) -> int:
         dashboard.serve(cfg, host=args.host, port=args.port)
         return 0
 
+    if args.cmd == "bot":
+        from . import telegram_bot
+        try:
+            telegram_bot.run(cfg)
+        except KeyboardInterrupt:
+            log.info("Stopped by user")
+        return 0
+
+    if args.cmd == "log-meal-ai":
+        from . import db, llm
+        meal = llm.extract_meal_from_text(cfg, args.desc)
+        if meal is None:
+            print("No meal extracted (check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or refine the description).")
+            return 1
+        meal.setdefault("source", "ai-cli")
+        if args.meal_time:
+            meal["meal_time"] = args.meal_time
+        mid = db.insert_meal(cfg.db_path, meal)
+        print(f"Logged meal #{mid}: {meal.get('description', args.desc)} ({meal.get('kcal', '—')} kcal)")
+        return 0
+
     if args.cmd == "prune":
         from . import db
         with db.connect(cfg.db_path) as conn:
@@ -155,31 +182,15 @@ def main(argv: list[str] | None = None) -> int:
         if info is None:
             print(f"Barcode {args.barcode} not found in Open Food Facts.")
             return 1
-        grams = args.grams
-        if grams is None:
+        if args.grams is None:
             grams = info.get("serving_size_g") or 100.0
             print(f"No --grams given; using {grams}g (serving size from API).")
-        factor = grams / 100.0
+        else:
+            grams = args.grams
 
-        def _scale(per100: float | None) -> float | None:
-            return round(per100 * factor, 1) if per100 is not None else None
-
-        meal = {
-            "description": f"{info['name']} ({grams:.0f}g)",
-            "source": "barcode",
-            "barcode": args.barcode,
-            "kcal": _scale(info.get("kcal_100g")),
-            "protein_g": _scale(info.get("protein_100g")),
-            "carbs_g": _scale(info.get("carbs_100g")),
-            "fat_g": _scale(info.get("fat_100g")),
-            "fiber_g": _scale(info.get("fiber_100g")),
-            "sugars_g": _scale(info.get("sugars_100g")),
-            "saturated_fat_g": _scale(info.get("saturated_fat_100g")),
-            "sodium_mg": _scale(info.get("sodium_mg_100g")),
-            "food_category": info.get("food_category"),
-            "meal_time": args.meal_time,
-            "raw_json": json.dumps(info.get("raw") or {}),
-        }
+        meal = food.meal_from_barcode_info(info, args.barcode, grams=grams)
+        meal["meal_time"] = args.meal_time
+        meal["raw_json"] = json.dumps(info.get("raw") or {})
         mid = db.insert_meal(cfg.db_path, meal)
         print(
             f"Logged meal #{mid}: {meal['description']} → "

@@ -1,0 +1,3 @@
+# Optional dependencies for the Telegram meal-logging bot. Install with:
+#   .venv/bin/pip install -r requirements-bot.txt
+anthropic>=0.40.0

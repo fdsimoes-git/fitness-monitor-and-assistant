@@ -73,6 +73,23 @@ CREATE INDEX IF NOT EXISTS idx_meals_meal_time ON meals(meal_time);
 """
 
 
+def local_today() -> date:
+    """The Pi's local 'today'.
+
+    The codebase has a deliberate split: timestamps are stored in UTC (they
+    represent the absolute moment something happened — never lie about
+    that), but day-bucketing for queries follows the user's local timezone.
+    Most date columns in this DB are local-formatted:
+    - `daily_summary.date` — written by the poller as `date.today().isoformat()`
+    - `activities.date` — derived from Garmin's `startTimeLocal[:10]`
+    Helpers that compare against those columns therefore must use local
+    "today", not UTC's. UTC and local can disagree by a calendar day around
+    midnight, which previously caused the dashboard's 7-day balance and
+    year heatmap to show next-day entries during late evening on UTC-3+.
+    """
+    return date.today()
+
+
 @contextmanager
 def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +179,9 @@ def upsert_activity(db_path: Path, fields: dict) -> None:
 
 def recent_activities(db_path: Path, days: int = 7) -> list[dict]:
     """Return activities with `date` within the last `days` days, newest first."""
-    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    # `activities.date` is local-formatted (Garmin's startTimeLocal[:10]),
+    # so the cutoff must be Pi-local — not UTC.
+    cutoff = (local_today() - timedelta(days=days)).isoformat()
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -193,9 +212,19 @@ def insert_meal(db_path: Path, meal: dict) -> int:
     if not meal.get("source"):
         raise ValueError("insert_meal requires source")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Normalize meal_time to UTC ISO so the column shape is consistent
+    # regardless of whether the model passed a tz-aware ISO or a naive one
+    # (Claude tool calls sometimes return naive timestamps because the
+    # system prompt frames "today" in Pi-local terms). _iso_to_utc_aware
+    # treats naive as local — the user's likely intent — and converts.
+    raw_meal_time = meal.get("meal_time") or now
+    try:
+        meal_time = _iso_to_utc_aware(raw_meal_time).isoformat(timespec="seconds")
+    except (TypeError, ValueError):
+        meal_time = now  # fall back rather than blocking the insert
     values = {
         "logged_at": now,
-        "meal_time": meal.get("meal_time") or now,
+        "meal_time": meal_time,
         "description": meal["description"],
         "source": meal["source"],
         "barcode": meal.get("barcode"),
@@ -224,6 +253,77 @@ def insert_meal(db_path: Path, meal: dict) -> int:
             conn.execute("ROLLBACK")
             raise
     return int(cur.lastrowid)
+
+
+def get_meal_by_id(db_path: Path, meal_id: int) -> dict | None:
+    """Fetch a single meal row by primary key."""
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM meals WHERE id = ?", (int(meal_id),)).fetchone()
+    return dict(row) if row else None
+
+
+# Columns on `meals` that the chat-driven edit tool is allowed to mutate.
+# Public so the LLM tool dispatcher can filter against the same set BEFORE
+# stashing a proposal — otherwise the proposal can claim it'll edit fields
+# (source, raw_json, …) that update_meal then silently drops.
+EDITABLE_MEAL_COLUMNS = {
+    "description", "kcal", "protein_g", "carbs_g", "fat_g",
+    "fiber_g", "sugars_g", "saturated_fat_g", "sodium_mg",
+    "food_category", "meal_time",
+}
+
+
+def update_meal(db_path: Path, meal_id: int, fields: dict) -> bool:
+    """Partial update of a meal row. Only columns in `EDITABLE_MEAL_COLUMNS` are
+    applied; unknown keys are silently dropped (the tool layer is the validator).
+
+    Two extra defenses on top of the column allowlist:
+
+    - **NOT NULL guard**: the schema marks `meal_time` and `description` as
+      NOT NULL. If the model passes an empty/None value for either, drop
+      it from the payload rather than letting SQLite raise IntegrityError
+      (or accept a useless empty string).
+    - **meal_time normalization**: matches `insert_meal`'s invariant —
+      route any supplied `meal_time` through `_iso_to_utc_aware` so the
+      column always carries a tz suffix, regardless of what the model
+      typed. Unparseable values are dropped, not stored.
+
+    Returns True if a row was updated, False if no row matched the id or no
+    valid fields were supplied (after the guards above).
+    """
+    payload = {k: v for k, v in (fields or {}).items() if k in EDITABLE_MEAL_COLUMNS}
+
+    # Drop NOT NULL columns being set to None or empty/whitespace strings.
+    for not_null_col in ("meal_time", "description"):
+        if not_null_col in payload:
+            v = payload[not_null_col]
+            if v is None or (isinstance(v, str) and not v.strip()):
+                del payload[not_null_col]
+
+    # Normalize meal_time to UTC ISO if still present.
+    if "meal_time" in payload:
+        try:
+            payload["meal_time"] = _iso_to_utc_aware(
+                payload["meal_time"]
+            ).isoformat(timespec="seconds")
+        except (TypeError, ValueError):
+            del payload["meal_time"]  # bad value → drop, don't store garbage
+
+    if not payload:
+        return False
+    set_sql = ", ".join(f"{k} = :{k}" for k in payload)
+    payload["meal_id"] = int(meal_id)
+    with connect(db_path) as conn:
+        cur = conn.execute(f"UPDATE meals SET {set_sql} WHERE id = :meal_id", payload)
+    return (cur.rowcount or 0) > 0
+
+
+def delete_meal(db_path: Path, meal_id: int) -> bool:
+    """Delete one meal row. Returns True if a row was removed."""
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM meals WHERE id = ?", (int(meal_id),))
+    return (cur.rowcount or 0) > 0
 
 
 def meals_for_date(db_path: Path, date_iso: str) -> list[dict]:
@@ -374,8 +474,10 @@ def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
     daily_summary and alerts are kept forever (one row per day, tiny).
     Returns a dict of table_name -> rows deleted.
     """
+    # `meal_time` is stored as a UTC ISO timestamp → cutoff must be UTC.
+    # `activities.date` is local-formatted → cutoff must be Pi-local.
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
-    cutoff_date = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    cutoff_date = (local_today() - timedelta(days=days)).isoformat()
     deleted: dict[str, int] = {}
     cur = con.execute("DELETE FROM activities WHERE date < ?", (cutoff_date,))
     deleted["activities"] = cur.rowcount or 0
@@ -478,6 +580,30 @@ def whole_food_pct(db_path: Path, date_iso: str) -> float | None:
     return round((total - discretionary) / total, 3)
 
 
+def _iso_to_utc_aware(iso_str: str) -> datetime:
+    """Parse an ISO timestamp string to a UTC-aware datetime.
+
+    The schema declares `meal_time` as UTC ISO, but in practice Claude tool
+    calls sometimes return naive timestamps (no tz suffix) because the model
+    is reasoning in Pi-local time under the "Today is …" system prompt.
+    Treat naive values as local time (the most likely intent), then convert
+    to UTC. This makes downstream math (`datetime.now(utc) - x`) safe
+    regardless of which shape is in storage.
+
+    Pre-normalize a trailing `Z` to `+00:00`: `datetime.fromisoformat`
+    accepts `Z` only on Python ≥ 3.11. Supporting older Pythons (and
+    being defensive in general) keeps a valid UTC `Z` timestamp from
+    silently falling through the `insert_meal` exception path.
+    """
+    s = iso_str.strip() if isinstance(iso_str, str) else iso_str
+    if isinstance(s, str) and s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # interpret naive as system local
+    return dt.astimezone(timezone.utc)
+
+
 def meal_timing_summary(db_path: Path, date_iso: str) -> dict | None:
     """First/last meal of the day and the gap from last meal to now.
 
@@ -486,13 +612,12 @@ def meal_timing_summary(db_path: Path, date_iso: str) -> dict | None:
     meals = meals_for_date(db_path, date_iso)
     if not meals:
         return None
-    first_iso = meals[0]["meal_time"]
-    last_iso = meals[-1]["meal_time"]
-    first_dt = datetime.fromisoformat(first_iso).astimezone()
-    last_dt = datetime.fromisoformat(last_iso).astimezone()
+    first_dt = _iso_to_utc_aware(meals[0]["meal_time"]).astimezone()  # display in local
+    last_dt = _iso_to_utc_aware(meals[-1]["meal_time"]).astimezone()
     eating_window_h = round((last_dt - first_dt).total_seconds() / 3600.0, 2)
     fasting_h_since_last = round(
-        (datetime.now(timezone.utc) - datetime.fromisoformat(last_iso)).total_seconds() / 3600.0,
+        (datetime.now(timezone.utc) - _iso_to_utc_aware(meals[-1]["meal_time"])).total_seconds()
+        / 3600.0,
         2,
     )
     return {
@@ -508,9 +633,10 @@ def recent_calorie_balance(db_path: Path, days: int, cfg) -> list[dict]:
     """[{date, balance_kcal}] for the last `days` calendar days, oldest first.
 
     Pulls the per-day balance via `calorie_balance_for_date` so the math stays
-    consistent with the CLI / dashboard output.
+    consistent with the CLI / dashboard output. Anchored on Pi-local "today"
+    to match the rest of the codebase (see `local_today`).
     """
-    today = datetime.now(timezone.utc).date()
+    today = local_today()
     out: list[dict] = []
     for offset in range(days - 1, -1, -1):
         d = (today - timedelta(days=offset)).isoformat()
@@ -621,8 +747,10 @@ def daily_readiness_history(db_path: Path, days: int, cfg) -> list[dict]:
     """[{date, score}] for the last `days` days ending today, oldest first.
 
     Skips days where the score is None (no data) — caller renders empty cells.
+    Anchored on Pi-local "today" so the heatmap's most recent cell stays
+    aligned with what the user calls "today" (see `local_today`).
     """
-    today = datetime.now(timezone.utc).date()
+    today = local_today()
     out: list[dict] = []
     for offset in range(days - 1, -1, -1):
         d = (today - timedelta(days=offset)).isoformat()
