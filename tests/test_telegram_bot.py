@@ -26,6 +26,24 @@ from src import db, telegram_bot
 from src.config import Config
 
 
+@pytest.fixture(autouse=True)
+def _no_real_telegram_http(monkeypatch):
+    """Default-stub the bot's outbound HTTP helpers so no test ever talks to
+    api.telegram.org. Individual tests can still re-patch any of these to
+    assert behavior; this fixture only protects tests that don't explicitly
+    care about a given helper.
+    """
+    monkeypatch.setattr("src.telegram_bot._send_typing", lambda cfg: None)
+    monkeypatch.setattr("src.telegram_bot._send_status", lambda cfg, text: 1)
+    monkeypatch.setattr("src.telegram_bot._edit_status", lambda cfg, msg_id, text: None)
+    monkeypatch.setattr("src.telegram_bot._delete_message", lambda cfg, msg_id: None)
+    monkeypatch.setattr("src.telegram_bot._answer_callback", lambda cfg, cid, text: None)
+    monkeypatch.setattr(
+        "src.telegram_bot._edit_message_remove_keyboard",
+        lambda cfg, chat_id, msg_id, text: None,
+    )
+
+
 @pytest.fixture
 def tmpdb():
     with tempfile.TemporaryDirectory() as d:
@@ -167,16 +185,16 @@ def test_plain_text_routes_to_chat(tmpdb):
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
     with patch("src.telegram_bot.llm.chat", return_value="Logged: yogurt with granola — 320 kcal.") as mock_chat, \
-         patch("src.telegram_bot._send_plain") as mock_send:
+         patch("src.telegram_bot._edit_status") as mock_edit:
         telegram_bot.dispatch(cfg, _msg(text="yogurt with granola"), pending)
-    # chat is called with cfg, the user text, and the same pending dict.
     args, kwargs = mock_chat.call_args
     assert args[0] is cfg
     assert args[1] == "yogurt with granola"
     assert args[2] is pending
     assert kwargs.get("image_bytes") is None
-    mock_send.assert_called_once()
-    assert "Logged: yogurt" in mock_send.call_args.args[1]
+    # Final answer is edited into the thinking message rather than sent fresh.
+    mock_edit.assert_called_once()
+    assert "Logged: yogurt" in mock_edit.call_args.args[2]
 
 
 def test_plain_text_surfaces_keyboard_for_each_new_pending_entry(tmpdb):
@@ -190,12 +208,15 @@ def test_plain_text_surfaces_keyboard_for_each_new_pending_entry(tmpdb):
         return "Logged your oats."
 
     with patch("src.telegram_bot.llm.chat", side_effect=fake_chat), \
-         patch("src.telegram_bot._send_plain") as mock_send, \
+         patch("src.telegram_bot._edit_status") as mock_edit, \
          patch("src.telegram_bot._send_with_keyboard") as mock_kb:
         telegram_bot.dispatch(cfg, _msg(text="oats 350 kcal"), pending)
 
-    mock_send.assert_called_once()  # the "Logged your oats." reply
-    mock_kb.assert_called_once()    # the Confirm/Cancel keyboard for the new pending entry
+    # Final answer goes via edit (into the thinking message)…
+    mock_edit.assert_called_once()
+    assert "Logged your oats" in mock_edit.call_args.args[2]
+    # …and a separate keyboard for the proposal.
+    mock_kb.assert_called_once()
     body = mock_kb.call_args.args[1]
     assert "oats" in body
     kb = mock_kb.call_args.args[2]
@@ -204,22 +225,23 @@ def test_plain_text_surfaces_keyboard_for_each_new_pending_entry(tmpdb):
 
 
 def test_plain_text_replies_with_failure_when_chat_returns_none(tmpdb):
+    """No proposals AND no text → the thinking message is edited into a clear failure."""
     cfg = _make_cfg(tmpdb)
     pending: dict[str, dict] = {}
     with patch("src.telegram_bot.llm.chat", return_value=None), \
-         patch("src.telegram_bot._send_plain") as mock_send:
+         patch("src.telegram_bot._edit_status") as mock_edit:
         telegram_bot.dispatch(cfg, _msg(text="hello"), pending)
-    mock_send.assert_called_once()
-    assert "couldn't reach Claude" in mock_send.call_args.args[1]
+    mock_edit.assert_called_once()
+    assert "couldn't reach Claude" in mock_edit.call_args.args[2]
 
 
 def test_plain_text_truncates_long_replies(tmpdb):
     cfg = _make_cfg(tmpdb)
     long_reply = "x" * 5000
     with patch("src.telegram_bot.llm.chat", return_value=long_reply), \
-         patch("src.telegram_bot._send_plain") as mock_send:
+         patch("src.telegram_bot._edit_status") as mock_edit:
         telegram_bot.dispatch(cfg, _msg(text="hello"), {})
-    sent = mock_send.call_args.args[1]
+    sent = mock_edit.call_args.args[2]
     assert len(sent) <= 4100  # 4000 + the "[…truncated]" suffix
     assert sent.endswith("[…truncated]")
 
@@ -352,6 +374,97 @@ def test_callback_expired_pending_replies_gracefully(tmpdb):
 
 
 # ── pending TTL sweep ─────────────────────────────────────────────────────
+
+
+# ── live progress feedback ────────────────────────────────────────────────
+
+
+def test_run_chat_posts_thinking_status_and_passes_progress_cb(tmpdb):
+    """Bot creates a status message, threads its msg_id through a progress_cb
+    that calls _edit_status, and edits the final answer into the same message."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+    captured = {}
+
+    def fake_chat(cfg_, text, p, **kw):
+        # Simulate the loop: progress_cb fires once per tool call.
+        cb = kw["progress_cb"]
+        cb("get_balance", {})
+        cb("lookup_barcode", {"barcode": "5449000000996"})
+        return "All set."
+
+    with patch("src.telegram_bot.llm.chat", side_effect=fake_chat) as mock_chat, \
+         patch("src.telegram_bot._send_status", return_value=42) as mock_status, \
+         patch("src.telegram_bot._edit_status") as mock_edit:
+        telegram_bot.dispatch(cfg, _msg(text="how am I doing?"), pending, history)
+
+    # Status message was sent at the start with the thinking placeholder.
+    mock_status.assert_called_once()
+    assert mock_status.call_args.args[1] == telegram_bot.THINKING_TEXT
+
+    # progress_cb was supplied to chat()
+    assert callable(mock_chat.call_args.kwargs["progress_cb"])
+
+    # Three edit_status calls: 2 tool updates + 1 final answer
+    assert mock_edit.call_count == 3
+    update_texts = [c.args[2] for c in mock_edit.call_args_list]
+    assert any("balance" in t for t in update_texts)
+    assert any("5449000000996" in t for t in update_texts)
+    # Final edit replaces the status with the answer text.
+    assert update_texts[-1] == "All set."
+
+
+def test_run_chat_deletes_status_when_no_text_and_proposals_present(tmpdb):
+    """Model parked a write proposal but didn't return text → status message
+    is deleted (the keyboard alone is the visible feedback)."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+
+    def fake_chat(cfg_, text, p, **kw):
+        p["pid1"] = {
+            "action": "insert",
+            "meal": {"description": "oats", "kcal": 350},
+            "ts": time.time(),
+        }
+        return None
+
+    with patch("src.telegram_bot.llm.chat", side_effect=fake_chat), \
+         patch("src.telegram_bot._send_status", return_value=99), \
+         patch("src.telegram_bot._delete_message") as mock_del, \
+         patch("src.telegram_bot._send_with_keyboard"):
+        telegram_bot.dispatch(cfg, _msg(text="oats"), pending, history)
+
+    mock_del.assert_called_once_with(cfg, 99)
+
+
+def test_format_tool_status_includes_specific_arguments():
+    assert "5449000000996" in telegram_bot._format_tool_status(
+        "lookup_barcode", {"barcode": "5449000000996"}
+    )
+    assert "#42" in telegram_bot._format_tool_status("edit_meal", {"meal_id": 42})
+    assert "#42" in telegram_bot._format_tool_status("delete_meal", {"meal_id": 42})
+    # Generic tools fall back to the static label
+    assert telegram_bot._format_tool_status("get_balance", {}).startswith("💰")
+
+
+def test_run_chat_falls_back_to_send_plain_when_status_message_fails(tmpdb):
+    """If _send_status returns None (Telegram down), chat still runs and the
+    answer goes through the regular _send_plain path — no UX regression."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+    with patch("src.telegram_bot.llm.chat", return_value="Hello back.") as mock_chat, \
+         patch("src.telegram_bot._send_status", return_value=None), \
+         patch("src.telegram_bot._send_plain") as mock_send, \
+         patch("src.telegram_bot._edit_status") as mock_edit:
+        telegram_bot.dispatch(cfg, _msg(text="hello"), pending, history)
+    # progress_cb is None when status couldn't be created
+    assert mock_chat.call_args.kwargs["progress_cb"] is None
+    mock_edit.assert_not_called()
+    mock_send.assert_called_once()
+    assert mock_send.call_args.args[1] == "Hello back."
 
 
 # ── chat history ──────────────────────────────────────────────────────────

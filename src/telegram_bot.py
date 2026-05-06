@@ -54,6 +54,25 @@ INITIAL_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 60.0
 BARCODE_PATTERN = re.compile(r"^\d{8,14}$")
 HISTORY_MAX_PAIRS = 10  # keep the last N user/assistant pairs for context continuity
+THINKING_TEXT = "🔄 thinking…"
+
+# Maps a tool name to a short, human-readable status the bot edits into the
+# in-flight "thinking" message before each tool runs. Keep these snappy —
+# they show up in real time while the user is waiting on Claude.
+_TOOL_STATUS_LABELS: dict[str, str] = {
+    "get_balance": "💰 checking today's balance",
+    "get_meals": "🍽️ pulling meals",
+    "get_recent_meals": "🍽️ scanning recent meals",
+    "get_daily_summary": "📊 reading Garmin's daily summary",
+    "get_trends": "📈 analyzing trends",
+    "get_activities": "🏃 looking up activities",
+    "get_readiness": "✨ computing readiness",
+    "get_training_intel": "💪 crunching training metrics",
+    "log_meal": "📝 preparing meal log",
+    "edit_meal": "✏️ preparing edit",
+    "delete_meal": "🗑️ preparing delete",
+    "lookup_barcode": "🏷️ looking up barcode",
+}
 
 HELP_TEXT = (
     "*garmin-monitor — fitness & nutrition assistant*\n\n"
@@ -250,33 +269,59 @@ def _run_chat(
     image_bytes: bytes | None = None,
     mime_type: str | None = None,
 ) -> None:
-    """Dispatch to llm.chat() and surface a Confirm/Cancel keyboard for any
-    write proposals it parked in `pending`. The chat reply (when present) is
-    sent first; keyboards follow.
+    """Dispatch to llm.chat() with live progress feedback and surface a
+    Confirm/Cancel keyboard for any write proposals it parked in `pending`.
+
+    Posts a "🔄 thinking…" status message at the start, edits it in real time
+    as Claude calls each tool ("🏷️ looking up barcode 5449000000996…",
+    "📝 preparing meal log…"), and either edits the final text reply into
+    that same message (if the model returned text) or deletes the status
+    when only proposals were created (the keyboards are the visible UX).
 
     Appends a (user, assistant) pair to `history` so the next turn sees the
     prior context. Past photo turns are stored as text placeholders — we
     deliberately don't replay image bytes for older turns (token-cost +
     diminishing relevance after the first reasoning pass)."""
+    _send_typing(cfg)
+    status_msg_id = _send_status(cfg, THINKING_TEXT)
+
+    progress_cb = None
+    if status_msg_id is not None:
+        def progress_cb(tool_name: str, tool_input: dict) -> None:  # noqa: ARG001 — closure over status_msg_id
+            _edit_status(cfg, status_msg_id, _format_tool_status(tool_name, tool_input))
+
     pending_before = set(pending.keys())
     answer = llm.chat(
         cfg, user_text, pending,
         image_bytes=image_bytes, mime_type=mime_type,
-        history=history,
+        history=history, progress_cb=progress_cb,
     )
     new_pids = [pid for pid in pending if pid not in pending_before]
 
+    # Resolve the status message: edit-into-answer is one round-trip vs
+    # delete+send (two), so we prefer it when there's a text reply.
     if answer:
         if len(answer) > 4000:
             answer = answer[:4000].rstrip() + "\n\n[…truncated]"
-        _send_plain(cfg, answer)
-    elif not new_pids:
-        # No reply and no proposal → make sure the user knows something's off.
-        _send_plain(
-            cfg,
-            "I couldn't reach Claude (check ANTHROPIC_API_KEY / "
-            "CLAUDE_CODE_OAUTH_TOKEN) or didn't get a useful response.",
-        )
+        if status_msg_id is not None:
+            _edit_status(cfg, status_msg_id, answer)
+        else:
+            _send_plain(cfg, answer)
+    else:
+        # No text reply. If the model parked proposals, the Confirm/Cancel
+        # keyboards are the visible feedback — drop the status. If nothing
+        # happened at all, swap the status into a clear failure message.
+        if not new_pids:
+            failure = (
+                "I couldn't reach Claude (check ANTHROPIC_API_KEY / "
+                "CLAUDE_CODE_OAUTH_TOKEN) or didn't get a useful response."
+            )
+            if status_msg_id is not None:
+                _edit_status(cfg, status_msg_id, failure)
+            else:
+                _send_plain(cfg, failure)
+        elif status_msg_id is not None:
+            _delete_message(cfg, status_msg_id)
 
     for pid in new_pids:
         _surface_pending(cfg, pid, pending[pid])
@@ -476,6 +521,70 @@ def _download_telegram_file(cfg: Config, file_id: str) -> tuple[bytes | None, st
     except Exception as e:  # noqa: BLE001
         log.error("Failed to download file %s: %s", file_id, e)
         return None, ""
+
+
+def _send_typing(cfg: Config) -> None:
+    """Fire a one-shot 'typing…' indicator. Auto-clears after ~5s on Telegram's side."""
+    api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
+    try:
+        requests.post(
+            f"{api}/sendChatAction",
+            json={"chat_id": cfg.telegram_chat_id, "action": "typing"},
+            timeout=5,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("sendChatAction failed (non-fatal): %s", e)
+
+
+def _send_status(cfg: Config, text: str) -> int | None:
+    """Send a status message and return its message_id for later edits, or None on failure."""
+    api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
+    try:
+        r = requests.post(
+            f"{api}/sendMessage",
+            json={"chat_id": cfg.telegram_chat_id, "text": text},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return ((r.json() or {}).get("result") or {}).get("message_id")
+    except Exception as e:  # noqa: BLE001
+        log.debug("send_status failed (non-fatal): %s", e)
+        return None
+
+
+def _edit_status(cfg: Config, msg_id: int, text: str) -> None:
+    api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
+    try:
+        requests.post(
+            f"{api}/editMessageText",
+            json={"chat_id": cfg.telegram_chat_id, "message_id": msg_id, "text": text},
+            timeout=5,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("edit_status failed (non-fatal): %s", e)
+
+
+def _delete_message(cfg: Config, msg_id: int) -> None:
+    api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
+    try:
+        requests.post(
+            f"{api}/deleteMessage",
+            json={"chat_id": cfg.telegram_chat_id, "message_id": msg_id},
+            timeout=5,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("delete_message failed (non-fatal): %s", e)
+
+
+def _format_tool_status(tool_name: str, tool_input: dict) -> str:
+    """Render the per-tool status label, with light per-tool customization."""
+    label = _TOOL_STATUS_LABELS.get(tool_name, f"🔧 calling {tool_name}")
+    if tool_name == "lookup_barcode" and tool_input.get("barcode"):
+        label = f"🏷️ looking up barcode {tool_input['barcode']}"
+    elif tool_name in ("edit_meal", "delete_meal") and tool_input.get("meal_id") is not None:
+        verb = "✏️ preparing edit" if tool_name == "edit_meal" else "🗑️ preparing delete"
+        label = f"{verb} for meal #{tool_input['meal_id']}"
+    return label + "…"
 
 
 def _send_plain(cfg: Config, text: str) -> bool:

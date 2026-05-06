@@ -127,6 +127,17 @@ Pending entries TTL-out after 1h via `_sweep_pending`. If the bot restarts mid-c
 
 `llm.chat()` accepts optional `image_bytes` + `mime_type` and inserts them as a base64 image content block in the user message. The model sees the image alongside any caption text and can call any tool. Asset-management has no vision in chat — this is a Telegram-specific extension. **Image bytes are never persisted** — the buffer is dropped right after the SDK call returns; `tests/test_telegram_bot.py::test_photo_flow_does_not_leak_image_bytes_to_db` enforces this.
 
+#### Live progress feedback
+
+`llm.chat()` accepts an optional `progress_cb(tool_name, tool_input)` invoked just before each tool runs. The bot's `_run_chat`:
+
+1. Sends a typing indicator and a "🔄 thinking…" status message at the start (capturing its `message_id`).
+2. Builds a closure over that `message_id` that calls `_edit_status` with the per-tool label from `_TOOL_STATUS_LABELS` (e.g. "🏷️ looking up barcode 5449000000996…", "📝 preparing meal log…").
+3. Passes that closure into `chat()` as `progress_cb`. Failures inside the callback are caught in `chat()` and logged — a broken UI hook never breaks the loop.
+4. After `chat()` returns, edits the **same** status message into the final answer (single round-trip) instead of sending a new message. If only proposals were created (model went silent + Confirm/Cancel keyboards visible), deletes the status message.
+
+Tests stub all four bot HTTP helpers (`_send_typing`, `_send_status`, `_edit_status`, `_delete_message`, plus `_answer_callback` and `_edit_message_remove_keyboard`) via an autouse fixture so the suite never touches `api.telegram.org`.
+
 #### Conversational history
 
 `run()` keeps a `history: list[{role, content}]` next to `pending` and threads it through `dispatch` → `_handle_text` / `_handle_photo` → `_run_chat`. Each chat-routed turn appends a `(user, assistant)` pair via `_append_history`; the list is trimmed to the last `HISTORY_MAX_PAIRS = 10` pairs (20 entries). `llm.chat()` prepends `history` verbatim to its `messages` list before the current user turn — it never mutates the caller's list.

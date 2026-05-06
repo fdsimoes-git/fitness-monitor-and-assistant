@@ -549,6 +549,58 @@ def test_chat_with_history_and_image_sends_image_only_for_current_turn():
     assert any(c.get("type") == "image" for c in sent[-1]["content"])
 
 
+def test_chat_invokes_progress_cb_once_per_tool_use_block():
+    """The progress callback fires before each tool's dispatcher runs and is
+    given the tool name + input dict — never the SDK block itself."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    tool_use_resp = SimpleNamespace(
+        content=[
+            _tool_use_block("tu_1", "get_balance", {}),
+            _tool_use_block("tu_2", "lookup_barcode", {"barcode": "5449000000996"}),
+        ],
+        stop_reason="tool_use",
+    )
+    final_resp = SimpleNamespace(
+        content=[_text_block("Two tools called.")],
+        stop_reason="end_turn",
+    )
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [tool_use_resp, final_resp]
+    seen: list[tuple[str, dict]] = []
+    with patch("src.llm.build_anthropic_client", return_value=fake_client), \
+         patch("src.llm.db.calorie_balance_for_date", return_value={"balance_kcal": 0}), \
+         patch("src.llm.food.lookup_barcode", return_value=None):
+        out = llm.chat(cfg, "x", {}, progress_cb=lambda name, input_: seen.append((name, input_)))
+    assert out == "Two tools called."
+    assert seen == [
+        ("get_balance", {}),
+        ("lookup_barcode", {"barcode": "5449000000996"}),
+    ]
+
+
+def test_chat_progress_cb_failure_does_not_break_loop():
+    """A buggy callback must not abort the agentic loop — its exception is logged and ignored."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    tool_use_resp = SimpleNamespace(
+        content=[_tool_use_block("tu_1", "get_balance", {})],
+        stop_reason="tool_use",
+    )
+    final_resp = SimpleNamespace(
+        content=[_text_block("ok")], stop_reason="end_turn",
+    )
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [tool_use_resp, final_resp]
+
+    def broken_cb(*_args):
+        raise RuntimeError("display went away")
+
+    with patch("src.llm.build_anthropic_client", return_value=fake_client), \
+         patch("src.llm.db.calorie_balance_for_date", return_value={"balance_kcal": 0}):
+        out = llm.chat(cfg, "x", {}, progress_cb=broken_cb)
+    assert out == "ok"
+    assert fake_client.messages.create.call_count == 2
+
+
 def test_chat_full_log_meal_loop_parks_pending(tmpdb_cfg):
     """End-to-end through the agentic loop: model calls log_meal, tool stashes pending, model summarises."""
     from src import db as _db

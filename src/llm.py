@@ -685,6 +685,7 @@ def chat(
     image_bytes: bytes | None = None,
     mime_type: str | None = None,
     history: list[dict] | None = None,
+    progress_cb: "Any | None" = None,
 ) -> str | None:
     """Run an agentic conversation turn against `CHAT_TOOLS` and return the
     final text answer.
@@ -705,6 +706,12 @@ def chat(
     prepended to the messages list verbatim; this function does NOT mutate
     it. Past photo turns should be stored as text placeholders by the
     caller — we deliberately don't re-send image bytes for older turns.
+
+    `progress_cb`, when supplied, is called as `progress_cb(tool_name,
+    tool_input)` immediately before each tool is executed. Used by the
+    Telegram bot to surface "🏷️ looking up barcode…" style status updates
+    while the agent is mid-loop. Failures inside the callback are caught
+    so a broken UI hook never breaks the chat turn.
 
     Returns `None` if no credentials, no text in the final reply, or the
     loop exceeds `CHAT_MAX_ITERATIONS`.
@@ -761,6 +768,11 @@ def chat(
                     block.get("name") if isinstance(block, dict) else None
                 )
                 input_data = _block_input(block)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(name, input_data)
+                    except Exception:  # noqa: BLE001 — UI hook must never break the loop
+                        log.exception("progress_cb raised — continuing")
                 try:
                     result = _execute_chat_tool(name, input_data, cfg, pending)
                 except Exception as e:  # noqa: BLE001 — surface as tool error
