@@ -138,7 +138,7 @@ The FastAPI dashboard isn't a systemd unit by default — start it manually with
 
 ## License
 
-[MIT](./LICENSE) — personal use. The poller relies on `python-garminconnect`, which scrapes the consumer Garmin Connect site; this is unofficial and may break when Garmin updates their auth flow. For commercial use you'd need the [official Garmin Health API](https://developer.garmin.com/gc-developer-program/health-api/).
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Internals
 
