@@ -565,6 +565,32 @@ _LOG_MEAL_WRITE_FIELDS = frozenset({
     "food_category", "meal_time",
 })
 
+# Fields surfaced to the model when reading meals. Keeps tool_result tokens
+# small + predictable and matches what the tool description advertises.
+# `id` is included so the model can later reference it for edit/delete;
+# `raw_json` and `logged_at` are intentionally dropped (internal columns,
+# raw_json can be the full Open Food Facts payload — tens of KB per meal).
+_MEAL_READ_FIELDS = (
+    "id", "meal_time", "description", "source", "barcode",
+    "kcal", "protein_g", "carbs_g", "fat_g",
+    "fiber_g", "sugars_g", "saturated_fat_g", "sodium_mg",
+    "food_category",
+)
+
+# Same idea for daily_summary. `raw_json` is the full Garmin payload —
+# multi-KB per day — and is never described in the tool surface.
+_DAILY_SUMMARY_READ_FIELDS = (
+    "date", "resting_hr", "max_hr", "avg_hr", "steps",
+    "sleep_seconds", "stress_avg", "body_battery", "hrv_overnight",
+)
+
+
+def _project(row: dict | None, fields) -> dict | None:
+    """Return a new dict containing only `fields` from `row`. None passes through."""
+    if row is None:
+        return None
+    return {k: row.get(k) for k in fields}
+
 
 def _execute_chat_tool(
     name: str,
@@ -596,16 +622,16 @@ def _execute_chat_tool(
     if name == "get_balance":
         return db.calorie_balance_for_date(cfg.db_path, target, cfg=cfg)
     if name == "get_meals":
-        return db.meals_for_date(cfg.db_path, target)
+        return [_project(r, _MEAL_READ_FIELDS) for r in db.meals_for_date(cfg.db_path, target)]
     if name == "get_recent_meals":
         days = max(1, min(int(input_data.get("days") or 7), 30))
         out: list[dict] = []
         for offset in range(days - 1, -1, -1):
             d_iso = (today_d - timedelta(days=offset)).isoformat()
-            out.extend(db.meals_for_date(cfg.db_path, d_iso))
+            out.extend(_project(r, _MEAL_READ_FIELDS) for r in db.meals_for_date(cfg.db_path, d_iso))
         return out
     if name == "get_daily_summary":
-        return db.daily_summary_for(cfg.db_path, target)
+        return _project(db.daily_summary_for(cfg.db_path, target), _DAILY_SUMMARY_READ_FIELDS)
     if name == "get_trends":
         days = max(1, min(int(input_data.get("days") or 14), 90))
         return db.recent_daily_metrics(cfg.db_path, days)
@@ -702,7 +728,13 @@ def _summarize_pending(entry: dict) -> str:
     if action == "insert":
         meal = entry.get("meal") or {}
         kcal = meal.get("kcal")
-        return f"Log: {meal.get('description', '?')} — {int(kcal) if kcal is not None else '—'} kcal"
+        # Coerce defensively — model tool input may arrive stringly-typed
+        # ("350" instead of 350); int(...) on a string-with-decimal raises.
+        try:
+            kcal_str = str(int(round(float(kcal)))) if kcal is not None else "—"
+        except (TypeError, ValueError):
+            kcal_str = str(kcal)
+        return f"Log: {meal.get('description', '?')} — {kcal_str} kcal"
     if action == "edit":
         fields = entry.get("fields") or {}
         keys = ", ".join(fields.keys()) or "(no fields)"

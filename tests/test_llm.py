@@ -3,6 +3,11 @@
 All Anthropic SDK calls are mocked. No real network. Tool-use blocks are
 constructed as SimpleNamespace objects so they exercise the same `_first_tool_use`
 attribute-access path the real SDK Message objects do.
+
+`anthropic` is an optional dependency (in `requirements-bot.txt`). On a
+base install without bot extras these tests are skipped — `pytest` still
+runs the rest of the suite. Several tests patch `anthropic.Anthropic`
+directly, so the module must be importable for them to run at all.
 """
 from __future__ import annotations
 
@@ -13,10 +18,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import anthropic  # noqa: F401 — imported so we can patch it in build_anthropic_client
+# Skip the entire file (don't fail collection) when the optional bot SDK
+# isn't installed. Idiomatic pytest.
+pytest.importorskip("anthropic")
+import anthropic  # noqa: F401, E402 — imported so we can patch it in build_anthropic_client
 
-from src import llm
-from src.config import Config
+from src import llm  # noqa: E402
+from src.config import Config  # noqa: E402
 
 
 def _make_cfg(**overrides) -> Config:
@@ -378,6 +386,76 @@ def test_log_meal_tool_parks_in_pending_without_writing(tmpdb_cfg):
     from src import db as _db
     from datetime import date
     assert _db.meals_for_date(tmpdb_cfg.db_path, date.today().isoformat()) == []
+
+
+def test_summarize_pending_handles_string_kcal():
+    """`int(kcal)` would crash on '350.0' or 'abc'; coerce defensively."""
+    out_str = llm._summarize_pending({
+        "action": "insert",
+        "meal": {"description": "oats", "kcal": "350"},
+    })
+    assert "350" in out_str
+
+    out_decimal = llm._summarize_pending({
+        "action": "insert",
+        "meal": {"description": "rice", "kcal": "200.6"},
+    })
+    assert "201" in out_decimal  # rounded
+
+    # Total gibberish falls back to the raw value, not a crash.
+    out_bad = llm._summarize_pending({
+        "action": "insert",
+        "meal": {"description": "x", "kcal": "abc"},
+    })
+    assert "abc" in out_bad
+
+
+def test_get_meals_tool_drops_internal_columns(tmpdb_cfg):
+    """get_meals must NOT return raw_json or logged_at — both bloat tool_result
+    tokens and aren't part of the tool's documented surface."""
+    from src import db as _db
+    _db.insert_meal(tmpdb_cfg.db_path, {
+        "description": "oats", "source": "manual", "kcal": 350,
+        "raw_json": '{"giant": "payload here..." * 100}',
+    })
+    out = llm._execute_chat_tool("get_meals", {}, tmpdb_cfg, {})
+    assert isinstance(out, list) and len(out) == 1
+    row = out[0]
+    assert "raw_json" not in row
+    assert "logged_at" not in row
+    # Documented fields are still present.
+    assert row["description"] == "oats"
+    assert row["kcal"] == 350
+    assert "id" in row  # so the model can reference for edit/delete
+
+
+def test_get_recent_meals_tool_drops_internal_columns(tmpdb_cfg):
+    from src import db as _db
+    _db.insert_meal(tmpdb_cfg.db_path, {
+        "description": "lunch", "source": "manual", "kcal": 500,
+        "raw_json": '{"x": 1}',
+    })
+    out = llm._execute_chat_tool("get_recent_meals", {"days": 1}, tmpdb_cfg, {})
+    assert isinstance(out, list) and len(out) >= 1
+    for row in out:
+        assert "raw_json" not in row
+        assert "logged_at" not in row
+
+
+def test_get_daily_summary_tool_drops_raw_json(tmpdb_cfg):
+    """daily_summary.raw_json is the full Garmin payload — multi-KB.
+    Must not be returned to the LLM."""
+    from src import db as _db
+    _db.upsert_daily_summary(tmpdb_cfg.db_path, "2026-05-06", {
+        "resting_hr": 58, "max_hr": 165, "steps": 9000,
+        "raw_json": '{"giant": "payload"}' * 100,
+    })
+    out = llm._execute_chat_tool("get_daily_summary", {"date": "2026-05-06"},
+                                  tmpdb_cfg, {})
+    assert "raw_json" not in out
+    assert "fetched_at" not in out
+    assert out["resting_hr"] == 58
+    assert out["steps"] == 9000
 
 
 def test_log_meal_tool_drops_unexpected_keys_from_input(tmpdb_cfg):

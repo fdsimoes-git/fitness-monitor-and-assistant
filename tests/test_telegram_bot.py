@@ -540,6 +540,58 @@ def test_run_chat_falls_back_to_send_plain_when_status_message_fails(tmpdb):
     assert mock_send.call_args.args[1] == "Hello back."
 
 
+# ── /ask & /chat legacy prefix stripping ─────────────────────────────────
+
+
+def test_dispatch_strips_ask_prefix_before_forwarding_to_chat(tmpdb):
+    """Users who still type "/ask <question>" out of habit should have the
+    prefix stripped — the model shouldn't see "/ask" in its context."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+    with patch("src.telegram_bot.llm.chat", return_value="ok") as mock_chat:
+        telegram_bot.dispatch(cfg, _msg(text="/ask How's my protein this week?"), pending, history)
+    args, _ = mock_chat.call_args
+    assert args[1] == "How's my protein this week?"  # /ask stripped
+
+
+def test_dispatch_strips_chat_alias_too(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    with patch("src.telegram_bot.llm.chat", return_value="ok") as mock_chat:
+        telegram_bot.dispatch(cfg, _msg(text="/chat   what should I eat?"), {}, [])
+    assert mock_chat.call_args.args[1] == "what should I eat?"
+
+
+def test_dispatch_ask_alone_sends_usage_hint(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    with patch("src.telegram_bot.llm.chat") as mock_chat, \
+         patch("src.telegram_bot._send_plain") as mock_send:
+        telegram_bot.dispatch(cfg, _msg(text="/ask"), {}, [])
+    mock_chat.assert_not_called()
+    mock_send.assert_called_once()
+    assert "no /ask needed" in mock_send.call_args.args[1]
+
+
+# ── _format_meal_summary defensive numeric coercion ───────────────────────
+
+
+def test_format_meal_summary_handles_stringly_typed_numbers():
+    """LLM tool input may stringify numbers; the formatter must not crash."""
+    s = telegram_bot._format_meal_summary({
+        "description": "oats",
+        "kcal": "350",          # string
+        "protein_g": "12.5",    # string with decimal
+        "carbs_g": 60,          # already numeric
+        "fat_g": "abc",         # gibberish — should fall back, not raise
+    })
+    assert "oats" in s
+    assert "350" in s
+    assert "12g" in s or "13g" in s  # rounded
+    assert "60g" in s
+    # `abc` falls back to the value's repr rather than crashing.
+    assert "abc" in s
+
+
 # ── chat history ──────────────────────────────────────────────────────────
 
 

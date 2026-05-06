@@ -238,6 +238,23 @@ def _handle_text(
         _propose_barcode(cfg, text, pending)
         return
 
+    # Legacy /ask + /chat support: earlier revisions exposed these as
+    # explicit Q&A commands; the chat-first refactor made plain text the
+    # default path. Users who still type "/ask <question>" out of habit
+    # shouldn't have the literal "/ask " prefix forwarded into the model's
+    # context — strip it. An empty body sends a usage hint.
+    parts = text.split(maxsplit=1)
+    if parts[0].lower() in ("/ask", "/chat"):
+        body = parts[1].strip() if len(parts) > 1 else ""
+        if not body:
+            _send_plain(
+                cfg,
+                "Just chat with me — no /ask needed. Try a question, "
+                "describe a meal, or send a photo.",
+            )
+            return
+        text = body
+
     # Default: chat with the full tool surface.
     _run_chat(cfg, text, pending, history)
 
@@ -712,17 +729,27 @@ def _format_balance(bal: dict) -> str:
     )
 
 
+def _fmt_num(value: Any, *, fmt: str = ".0f") -> str:
+    """Defensively format a number that might come from LLM tool input as a
+    string ("350" instead of 350). Returns the value's string repr if
+    coercion fails so the bot never crashes building a confirmation."""
+    try:
+        return format(float(value), fmt)
+    except (TypeError, ValueError):
+        return str(value) if value is not None else "—"
+
+
 def _format_meal_summary(meal: dict) -> str:
     desc = meal.get("description") or "—"
     parts = [desc]
     kcal = meal.get("kcal")
     if kcal is not None:
-        parts.append(f"{kcal:.0f} kcal")
+        parts.append(f"{_fmt_num(kcal)} kcal")
     macros = []
     for label, key in (("P", "protein_g"), ("C", "carbs_g"), ("F", "fat_g")):
         v = meal.get(key)
         if v is not None:
-            macros.append(f"{v:.0f}g {label}")
+            macros.append(f"{_fmt_num(v)}g {label}")
     if macros:
         parts.append(" / ".join(macros))
     return " · ".join(parts)
