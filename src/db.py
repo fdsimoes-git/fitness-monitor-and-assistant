@@ -278,10 +278,38 @@ def update_meal(db_path: Path, meal_id: int, fields: dict) -> bool:
     """Partial update of a meal row. Only columns in `EDITABLE_MEAL_COLUMNS` are
     applied; unknown keys are silently dropped (the tool layer is the validator).
 
+    Two extra defenses on top of the column allowlist:
+
+    - **NOT NULL guard**: the schema marks `meal_time` and `description` as
+      NOT NULL. If the model passes an empty/None value for either, drop
+      it from the payload rather than letting SQLite raise IntegrityError
+      (or accept a useless empty string).
+    - **meal_time normalization**: matches `insert_meal`'s invariant —
+      route any supplied `meal_time` through `_iso_to_utc_aware` so the
+      column always carries a tz suffix, regardless of what the model
+      typed. Unparseable values are dropped, not stored.
+
     Returns True if a row was updated, False if no row matched the id or no
-    valid fields were supplied.
+    valid fields were supplied (after the guards above).
     """
     payload = {k: v for k, v in (fields or {}).items() if k in EDITABLE_MEAL_COLUMNS}
+
+    # Drop NOT NULL columns being set to None or empty/whitespace strings.
+    for not_null_col in ("meal_time", "description"):
+        if not_null_col in payload:
+            v = payload[not_null_col]
+            if v is None or (isinstance(v, str) and not v.strip()):
+                del payload[not_null_col]
+
+    # Normalize meal_time to UTC ISO if still present.
+    if "meal_time" in payload:
+        try:
+            payload["meal_time"] = _iso_to_utc_aware(
+                payload["meal_time"]
+            ).isoformat(timespec="seconds")
+        except (TypeError, ValueError):
+            del payload["meal_time"]  # bad value → drop, don't store garbage
+
     if not payload:
         return False
     set_sql = ", ".join(f"{k} = :{k}" for k in payload)
@@ -561,8 +589,16 @@ def _iso_to_utc_aware(iso_str: str) -> datetime:
     Treat naive values as local time (the most likely intent), then convert
     to UTC. This makes downstream math (`datetime.now(utc) - x`) safe
     regardless of which shape is in storage.
+
+    Pre-normalize a trailing `Z` to `+00:00`: `datetime.fromisoformat`
+    accepts `Z` only on Python ≥ 3.11. Supporting older Pythons (and
+    being defensive in general) keeps a valid UTC `Z` timestamp from
+    silently falling through the `insert_meal` exception path.
     """
-    dt = datetime.fromisoformat(iso_str)
+    s = iso_str.strip() if isinstance(iso_str, str) else iso_str
+    if isinstance(s, str) and s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.astimezone()  # interpret naive as system local
     return dt.astimezone(timezone.utc)

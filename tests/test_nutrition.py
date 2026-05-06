@@ -183,6 +183,72 @@ def test_meal_timing_summary_handles_naive_iso_meal_times(tmpdb):
     assert "hours_since_last_meal" in out
 
 
+def test_iso_to_utc_aware_handles_z_suffix():
+    """fromisoformat in Python <3.11 doesn't accept 'Z'; the helper must
+    pre-normalize so a valid UTC `Z` ISO doesn't fall through to the
+    insert_meal exception path and get clobbered by `now`."""
+    # `Z` in must round-trip to `+00:00` UTC out.
+    out = db._iso_to_utc_aware("2026-05-06T13:28:00Z")
+    assert out.tzinfo is not None
+    assert out.utcoffset().total_seconds() == 0
+    assert out.isoformat() == "2026-05-06T13:28:00+00:00"
+
+
+def test_iso_to_utc_aware_handles_explicit_tz():
+    """Sanity: tz-aware input with `+HH:MM` still parses correctly."""
+    out = db._iso_to_utc_aware("2026-05-06T10:28:00-03:00")
+    # Brazil 10:28 → UTC 13:28
+    assert out.isoformat() == "2026-05-06T13:28:00+00:00"
+
+
+def test_update_meal_normalizes_meal_time(tmpdb):
+    """update_meal must apply the same UTC-ISO invariant as insert_meal."""
+    mid = db.insert_meal(tmpdb, {"description": "lunch", "source": "manual", "kcal": 500})
+    naive = "2026-05-06T13:28:00"
+    assert db.update_meal(tmpdb, mid, {"meal_time": naive}) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    # Stored value carries a tz suffix.
+    assert after["meal_time"].endswith("+00:00") or "+" in after["meal_time"][10:]
+    # And it round-trips through fromisoformat as tz-aware.
+    parsed = datetime.fromisoformat(after["meal_time"])
+    assert parsed.tzinfo is not None
+
+
+def test_update_meal_drops_unparseable_meal_time(tmpdb):
+    """Garbage meal_time → drop the field rather than raise or store junk."""
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    before_meal_time = db.get_meal_by_id(tmpdb, mid)["meal_time"]
+    # `kcal` is valid; `meal_time` is gibberish — kcal should still apply.
+    assert db.update_meal(tmpdb, mid, {"kcal": 200, "meal_time": "not-a-date"}) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["kcal"] == 200
+    assert after["meal_time"] == before_meal_time  # untouched
+
+
+def test_update_meal_drops_none_for_not_null_columns(tmpdb):
+    """description and meal_time are NOT NULL — None/empty must be dropped from
+    the payload rather than triggering sqlite3.IntegrityError."""
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    # Mix valid (kcal) + invalid (description=None, meal_time="").
+    assert db.update_meal(tmpdb, mid, {
+        "kcal": 250,
+        "description": None,
+        "meal_time": "   ",
+    }) is True
+    after = db.get_meal_by_id(tmpdb, mid)
+    assert after["kcal"] == 250
+    assert after["description"] == "x"  # untouched, not nulled
+
+
+def test_update_meal_returns_false_when_only_invalid_fields(tmpdb):
+    """All-invalid payload (NOT NULL violations + bad timestamps) → False, no UPDATE."""
+    mid = db.insert_meal(tmpdb, {"description": "x", "source": "manual", "kcal": 100})
+    assert db.update_meal(tmpdb, mid, {
+        "description": None,
+        "meal_time": None,
+    }) is False
+
+
 def test_insert_meal_normalizes_naive_meal_time_to_utc(tmpdb):
     """Defense in depth: when Claude tool input comes in with a tz-less ISO,
     insert_meal normalizes to a UTC-aware ISO with a tz suffix so the column
