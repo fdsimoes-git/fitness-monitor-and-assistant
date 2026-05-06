@@ -231,6 +231,38 @@ def _block_input(block) -> dict:
     return dict((block or {}).get("input") or {})
 
 
+def _block_to_dict(block) -> dict:
+    """Normalize a content block (SDK pydantic, plain dict, or test
+    SimpleNamespace) to a JSON-serializable dict suitable for sending back to
+    the API on the next loop iteration. The Anthropic SDK *does* accept its
+    own block objects on input, but normalizing keeps the wire format stable
+    and avoids any reliance on SDK serializer internals.
+    """
+    if isinstance(block, dict):
+        return dict(block)
+    # Real SDK objects expose `model_dump`.
+    if hasattr(block, "model_dump"):
+        try:
+            return block.model_dump()
+        except Exception:  # noqa: BLE001 — fall through to manual extraction
+            pass
+    # Manual fallback (covers SimpleNamespace and any future block shape).
+    btype = getattr(block, "type", None)
+    if btype == "tool_use":
+        return {
+            "type": "tool_use",
+            "id": getattr(block, "id", None),
+            "name": getattr(block, "name", None),
+            "input": getattr(block, "input", {}) or {},
+        }
+    if btype == "text":
+        return {"type": "text", "text": getattr(block, "text", "")}
+    # Last-resort: copy public attrs into a dict.
+    return {"type": btype, **{
+        k: v for k, v in vars(block).items() if not k.startswith("_")
+    }}
+
+
 def extract_meal_from_text(cfg: Config, user_text: str) -> dict | None:
     """Run a meal description through Claude and return the structured meal dict.
 
@@ -553,7 +585,11 @@ def _execute_chat_tool(
     """
     if pending is None:
         pending = {}
-    today = date.today().isoformat()
+    # Route every "what local day is it?" lookup through `db.local_today` so
+    # the chat tools share the codebase-wide patchable seam (mocked in the
+    # _local_today regression tests in test_nutrition.py).
+    today_d = db.local_today()
+    today = today_d.isoformat()
     target = (input_data.get("date") or today)
 
     # ── Read tools ────────────────────────────────────────────────────────
@@ -564,7 +600,6 @@ def _execute_chat_tool(
     if name == "get_recent_meals":
         days = max(1, min(int(input_data.get("days") or 7), 30))
         out: list[dict] = []
-        today_d = date.today()
         for offset in range(days - 1, -1, -1):
             d_iso = (today_d - timedelta(days=offset)).isoformat()
             out.extend(db.meals_for_date(cfg.db_path, d_iso))
@@ -783,7 +818,14 @@ def chat(
         )
 
         if getattr(response, "stop_reason", None) == "tool_use":
-            messages.append({"role": "assistant", "content": list(response.content)})
+            # Normalize SDK content blocks to plain dicts before re-sending.
+            # The SDK accepts its own pydantic blocks on input, but plain
+            # dicts are more robust across SDK versions and let our test
+            # fixtures (SimpleNamespace) round-trip through the same path.
+            messages.append({
+                "role": "assistant",
+                "content": [_block_to_dict(b) for b in response.content],
+            })
             tool_results: list[dict] = []
             for block in response.content:
                 btype = getattr(block, "type", None) or (

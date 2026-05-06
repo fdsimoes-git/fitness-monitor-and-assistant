@@ -624,6 +624,73 @@ def test_chat_with_history_and_image_sends_image_only_for_current_turn():
     assert any(c.get("type") == "image" for c in sent[-1]["content"])
 
 
+def test_chat_normalizes_content_blocks_to_dicts_before_re_sending():
+    """The assistant turn appended to messages must contain plain dicts, not
+    SDK objects — protects against pydantic-vs-dict serializer mismatches on
+    the second loop iteration."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    tool_use_resp = SimpleNamespace(
+        content=[_tool_use_block("tu_1", "get_balance", {})],
+        stop_reason="tool_use",
+    )
+    final_resp = SimpleNamespace(
+        content=[_text_block("done")], stop_reason="end_turn",
+    )
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [tool_use_resp, final_resp]
+    with patch("src.llm.build_anthropic_client", return_value=fake_client), \
+         patch("src.llm.db.calorie_balance_for_date", return_value={"balance_kcal": 0}):
+        llm.chat(cfg, "x", {})
+    # Second call's messages should include the assistant turn with content
+    # as a list of plain dicts (not SimpleNamespace / SDK objects).
+    second = fake_client.messages.create.call_args_list[1].kwargs["messages"]
+    assistant_turn = next(m for m in second if m["role"] == "assistant")
+    for block in assistant_turn["content"]:
+        assert isinstance(block, dict), f"block is {type(block)}, expected dict"
+        assert "type" in block
+    # And it round-trips losslessly: still a tool_use with the same id+name+input.
+    tool_block = assistant_turn["content"][0]
+    assert tool_block["type"] == "tool_use"
+    assert tool_block["id"] == "tu_1"
+    assert tool_block["name"] == "get_balance"
+
+
+def test_block_to_dict_uses_model_dump_when_available():
+    """Real SDK blocks expose .model_dump(); use that path."""
+    class FakeSDKBlock:
+        def model_dump(self):
+            return {"type": "tool_use", "id": "tu_x", "name": "y", "input": {"a": 1}}
+
+    out = llm._block_to_dict(FakeSDKBlock())
+    assert out == {"type": "tool_use", "id": "tu_x", "name": "y", "input": {"a": 1}}
+
+
+def test_block_to_dict_falls_back_when_model_dump_raises():
+    """If model_dump raises (corrupt SDK state), the manual SimpleNamespace
+    fallback still produces a usable dict."""
+    class BrokenSDKBlock:
+        type = "text"
+        text = "hello"
+        def model_dump(self):
+            raise RuntimeError("boom")
+
+    out = llm._block_to_dict(BrokenSDKBlock())
+    assert out["type"] == "text"
+    assert out["text"] == "hello"
+
+
+def test_execute_chat_tool_uses_db_local_today(tmpdb_cfg):
+    """The dispatcher must route every 'what local day is it?' lookup through
+    db.local_today so day-bucketing is patchable in one place."""
+    from datetime import date as _date
+    fake_today = _date(2026, 5, 5)
+    with patch("src.llm.db.local_today", return_value=fake_today) as mock_local:
+        # get_balance with no date input → should resolve to local_today's ISO.
+        out = llm._execute_chat_tool("get_balance", {}, tmpdb_cfg, {})
+    assert mock_local.called
+    assert out["date"] == "2026-05-05"
+
+
 def test_chat_invokes_progress_cb_once_per_tool_use_block():
     """The progress callback fires before each tool's dispatcher runs and is
     given the tool name + input dict — never the SDK block itself."""

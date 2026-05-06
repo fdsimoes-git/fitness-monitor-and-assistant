@@ -153,7 +153,7 @@ def test_meal_timing_summary_computes_window_and_count(tmpdb):
 
 def test_recent_calorie_balance_returns_one_row_per_day(tmpdb):
     cfg = _make_cfg(tmpdb)
-    # Production anchors on Pi-local 'today' (db._local_today). Match here
+    # Production anchors on Pi-local 'today' (db.local_today). Match here
     # so this test isn't UTC-flaky around midnight.
     today = date.today()
     db.insert_meal(tmpdb, {"description": "today's lunch", "source": "manual", "kcal": 600.0})
@@ -221,32 +221,32 @@ def test_delete_meal_returns_false_for_missing(tmpdb):
     assert db.delete_meal(tmpdb, 99999) is False
 
 
-def test_local_today_helper_returns_local_date():
-    """Sanity: _local_today() agrees with date.today() right now."""
-    assert db._local_today() == date.today()
+def testlocal_today_helper_returns_local_date():
+    """Sanity: local_today() agrees with date.today() right now."""
+    assert db.local_today() == date.today()
 
 
-def test_recent_calorie_balance_anchors_on_local_today(tmpdb):
+def test_recent_calorie_balance_anchors_onlocal_today(tmpdb):
     """Last entry in the 7-day balance series must be local today, not UTC."""
     from unittest.mock import patch
     cfg = _make_cfg(tmpdb)
     fake_today = date(2026, 5, 5)  # local
-    with patch("src.db._local_today", return_value=fake_today):
+    with patch("src.db.local_today", return_value=fake_today):
         out = db.recent_calorie_balance(tmpdb, days=7, cfg=cfg)
     assert out[-1]["date"] == "2026-05-05"
     assert out[0]["date"] == "2026-04-29"
 
 
-def test_daily_readiness_history_anchors_on_local_today(tmpdb):
+def test_daily_readiness_history_anchors_onlocal_today(tmpdb):
     from unittest.mock import patch
     cfg = _make_cfg(tmpdb)
     fake_today = date(2026, 5, 5)
-    with patch("src.db._local_today", return_value=fake_today):
+    with patch("src.db.local_today", return_value=fake_today):
         out = db.daily_readiness_history(tmpdb, days=3, cfg=cfg)
     assert [r["date"] for r in out] == ["2026-05-03", "2026-05-04", "2026-05-05"]
 
 
-def test_recent_activities_cutoff_uses_local_today(tmpdb):
+def test_recent_activities_cutoff_useslocal_today(tmpdb):
     """An activity dated as Pi-local 2026-05-05 must be findable when
     queried at local 2026-05-05, even when UTC has rolled over to 05-06."""
     from unittest.mock import patch
@@ -255,7 +255,7 @@ def test_recent_activities_cutoff_uses_local_today(tmpdb):
         "name": "easy run", "duration_s": 1800, "distance_m": 4000,
         "avg_hr": 130, "max_hr": 150, "calories": 300, "training_effect": 2.5,
     })
-    with patch("src.db._local_today", return_value=date(2026, 5, 5)):
+    with patch("src.db.local_today", return_value=date(2026, 5, 5)):
         out = db.recent_activities(tmpdb, days=1)
     assert any(a["activity_id"] == "a1" for a in out)
 
