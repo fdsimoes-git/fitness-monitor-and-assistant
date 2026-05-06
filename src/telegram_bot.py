@@ -84,9 +84,11 @@ HELP_TEXT = (
 def run(cfg: Config) -> None:
     """Long-poll Telegram for messages until interrupted.
 
-    `pending` is a per-process dict mapping a short UUID to a proposed meal
-    awaiting Confirm/Cancel. Photos and barcode-from-photo proposals stash
-    here; text and explicit-barcode messages auto-insert without queuing.
+    `pending` is a per-process dict mapping a short UUID → a proposed write
+    awaiting Confirm/Cancel. Every meal-logging path (text, photo, numeric
+    barcode, and the chat write tools log_meal/edit_meal/delete_meal) parks
+    its proposal here before any DB write. Stale entries are swept by
+    `_sweep_pending`, called once per inbound update from `dispatch()`.
     """
     if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
         raise RuntimeError(
@@ -137,7 +139,13 @@ def _get_updates(cfg: Config, offset: int | None) -> list[dict]:
 
 
 def dispatch(cfg: Config, update: dict, pending: dict[str, dict[str, Any]]) -> None:
-    """Top-level update handler. Routes based on update kind and chat-id whitelist."""
+    """Top-level update handler. Routes based on update kind and chat-id whitelist.
+
+    Sweeps stale `pending` entries once per inbound update — this is the
+    single chokepoint that guarantees the dict can't grow unbounded
+    regardless of which path (chat, photo, barcode) created the proposal.
+    """
+    _sweep_pending(pending)
     if "callback_query" in update:
         q = update["callback_query"]
         cb_chat = (q.get("message") or {}).get("chat", {}).get("id")
@@ -249,7 +257,6 @@ def _propose_barcode(cfg: Config, barcode: str, pending: dict[str, dict[str, Any
         return
     meal = food.meal_from_barcode_info(info, barcode)
     pid = uuid.uuid4().hex[:10]
-    _sweep_pending(pending)
     pending[pid] = {"action": "insert", "meal": meal, "ts": time.time()}
     _surface_pending(cfg, pid, pending[pid])
 

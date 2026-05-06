@@ -14,12 +14,15 @@ Three paths:
    visually estimates the meal. **Image bytes are never persisted** — they
    live on the stack only for the duration of the API call.
 
-3. **Free-form chat** — `chat(cfg, user_text)` runs an agentic loop with
-   eight read-only tools that query the local DB (balance, meals, daily
-   summary, trends, activities, readiness, training intel). Triggered by
-   `/ask <prompt>` or `/chat <prompt>` in Telegram. Claude can chain
-   tool calls; we cap iterations at `CHAT_MAX_ITERATIONS` to stop
-   runaways.
+3. **Free-form chat** — `chat(cfg, user_text, pending, image_bytes=…)` runs
+   an agentic loop with twelve tools (`CHAT_TOOLS`): eight read-only DB
+   tools (balance, meals, daily summary, trends, activities, readiness,
+   training intel) plus four "validate-and-stash" write tools (`log_meal`,
+   `edit_meal`, `delete_meal`, `lookup_barcode`). Write tools never touch
+   the DB; they park a proposal in the caller's `pending` dict and the
+   Telegram bot surfaces a Confirm/Cancel keyboard before any actual write.
+   This is the default text + photo path. Claude can chain tool calls;
+   we cap iterations at `CHAT_MAX_ITERATIONS` to stop runaways.
 
 Credential resolution mirrors the asset-management pattern (`server.js`
 lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set, calls go via the OAuth
@@ -665,8 +668,9 @@ _CHAT_SYSTEM_TEMPLATE = (
     "lookup_barcode first, then log_meal with the result's fields.\n"
     "• To edit or remove a meal, first call get_meals or get_recent_meals to "
     "find the meal_id, then call edit_meal or delete_meal.\n"
-    "• Resolve relative time (\"yesterday\", \"this week\") to ISO dates "
-    "client-side before calling tools.\n"
+    "• Convert relative time references (\"yesterday\", \"this week\") to ISO "
+    "YYYY-MM-DD dates yourself before calling any tool — the tools accept ISO "
+    "dates only.\n"
     "• Replies render in a Telegram chat. Keep them concise (1–3 sentences "
     "unless the user asks for detail). Plain text — no Markdown.\n"
     "• You may chain multiple tool calls in one turn."

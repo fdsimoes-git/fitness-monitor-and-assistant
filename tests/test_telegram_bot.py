@@ -351,6 +351,27 @@ def test_callback_expired_pending_replies_gracefully(tmpdb):
     assert "expired" in mock_edit.call_args.args[3].lower()
 
 
+# ── pending TTL sweep ─────────────────────────────────────────────────────
+
+
+def test_dispatch_sweeps_stale_pending_entries(tmpdb):
+    """Every inbound update triggers a TTL sweep — even ones that originated
+    from the chat path (which used to skip _sweep_pending entirely)."""
+    cfg = _make_cfg(tmpdb)
+    # One stale entry (older than PENDING_TTL_SECONDS) and one fresh.
+    pending = {
+        "stale": {"action": "insert", "meal": {"description": "x", "kcal": 1},
+                  "ts": time.time() - telegram_bot.PENDING_TTL_SECONDS - 60},
+        "fresh": {"action": "insert", "meal": {"description": "y", "kcal": 2},
+                  "ts": time.time()},
+    }
+    # /help is the cheapest update — still goes through dispatch().
+    with patch("src.telegram_bot.alerts.send_telegram"):
+        telegram_bot.dispatch(cfg, _msg(text="/help"), pending)
+    assert "stale" not in pending
+    assert "fresh" in pending
+
+
 # ── end-to-end chains ─────────────────────────────────────────────────────
 
 
