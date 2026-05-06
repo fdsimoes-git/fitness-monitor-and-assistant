@@ -5,14 +5,21 @@ in `alerts.py` so we don't pull in a heavyweight Telegram library.
 
 The bot is now a chat agent (mirroring asset-management's financial advisor):
 plain text and photos are forwarded to `llm.chat()` with the full 12-tool
-surface — read tools (balance, meals, trends, readiness, training intel),
-plus four write tools (`log_meal`, `edit_meal`, `delete_meal`,
-`lookup_barcode`). Write tools follow the same validate-and-stash pattern as
-asset-management's `editEntry` / `deleteEntry`: the tool parks a proposal
-in the per-process `pending` dict; the bot diffs `pending` before/after the
-chat call and surfaces a Confirm/Cancel inline keyboard for each new
-proposal. Actual `db.insert_meal` / `db.update_meal` / `db.delete_meal`
-calls only fire when the user taps ✅.
+surface, split as:
+
+- **8 read-only DB tools** — balance, meals, recent_meals, daily_summary,
+  trends, activities, readiness, training_intel.
+- **3 validate-and-stash write tools** — `log_meal`, `edit_meal`,
+  `delete_meal`. These park a proposal in the per-process `pending` dict;
+  the bot diffs `pending` before/after the chat call and surfaces a
+  Confirm/Cancel inline keyboard for each new proposal. Actual
+  `db.insert_meal` / `db.update_meal` / `db.delete_meal` calls only fire
+  when the user taps ✅. Pattern mirrors asset-management's
+  `editEntry` / `deleteEntry`.
+- **1 read-only Open Food Facts tool** — `lookup_barcode`. It returns
+  scaled nutrition data for a packaged product and does NOT create a
+  pending write; the model typically chains it into a `log_meal` call
+  afterward.
 
 Dispatch tree
 ─────────────

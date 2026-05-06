@@ -15,12 +15,19 @@ Three paths:
    live on the stack only for the duration of the API call.
 
 3. **Free-form chat** — `chat(cfg, user_text, pending, image_bytes=…)` runs
-   an agentic loop with twelve tools (`CHAT_TOOLS`): eight read-only DB
-   tools (balance, meals, daily summary, trends, activities, readiness,
-   training intel) plus four "validate-and-stash" write tools (`log_meal`,
-   `edit_meal`, `delete_meal`, `lookup_barcode`). Write tools never touch
-   the DB; they park a proposal in the caller's `pending` dict and the
-   Telegram bot surfaces a Confirm/Cancel keyboard before any actual write.
+   an agentic loop with twelve tools (`CHAT_TOOLS`):
+
+   - **8 read-only DB tools** — balance, meals, recent_meals,
+     daily_summary, trends, activities, readiness, training_intel.
+   - **3 validate-and-stash write tools** — `log_meal`, `edit_meal`,
+     `delete_meal`. These never touch the DB themselves; they park a
+     proposal in the caller's `pending` dict and the Telegram bot
+     surfaces a Confirm/Cancel keyboard before any actual write.
+   - **1 read-only Open Food Facts tool** — `lookup_barcode`. Returns
+     scaled nutrition data for a packaged product (no DB write, no
+     proposal); the model typically chains it into a `log_meal` call
+     using the result's fields.
+
    This is the default text + photo path. Claude can chain tool calls;
    we cap iterations at `CHAT_MAX_ITERATIONS` to stop runaways.
 
