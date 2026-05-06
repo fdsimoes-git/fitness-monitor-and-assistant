@@ -109,16 +109,18 @@ All frontend assets (Tailwind, Chart.js, htmx) come from CDN — no build step.
 
 The 12 tools registered in `llm.CHAT_TOOLS`:
 
-| Read | Write |
-|---|---|
-| `get_balance` | `log_meal` (proposes insert) |
-| `get_meals` | `edit_meal` (proposes partial update) |
-| `get_recent_meals` | `delete_meal` (proposes delete) |
-| `get_daily_summary` | `lookup_barcode` (read-only OFF lookup) |
-| `get_trends` | |
-| `get_activities` | |
-| `get_readiness` | |
-| `get_training_intel` | |
+| Read-only DB (8) | Validate-and-stash writes (3) | OFF lookup (1, read-only) |
+|---|---|---|
+| `get_balance` | `log_meal` (proposes insert) | `lookup_barcode` |
+| `get_meals` | `edit_meal` (proposes partial update) | |
+| `get_recent_meals` | `delete_meal` (proposes delete) | |
+| `get_daily_summary` | | |
+| `get_trends` | | |
+| `get_activities` | | |
+| `get_readiness` | | |
+| `get_training_intel` | | |
+
+`lookup_barcode` is read-only — it queries Open Food Facts and returns scaled nutrition. The model typically chains it into a `log_meal` proposal afterward; that's the only path that touches the DB.
 
 #### Validate-and-stash two-phase write pattern
 
@@ -126,8 +128,8 @@ Mirrors `asset-management/server.js:4803-4823`. When Claude calls a write tool, 
 
 The bot's `_run_chat` snapshots `pending.keys()` before the call and diffs after. For each new pending entry it calls `_surface_pending`, which renders an action-aware Confirm/Cancel inline keyboard (✅ Log it / ✏️ Apply edit / 🗑 Delete). The `callback_data` shape (`confirm:UUID` / `cancel:UUID`) is uniform — `_handle_callback` doesn't need to know about action types; it pops the entry and dispatches to `_apply_pending`, which branches on `entry["action"]`:
 
-- `insert` → `db.insert_meal`
-- `edit` → `db.update_meal` (only `_EDITABLE_MEAL_COLUMNS` are accepted)
+- `insert` → `db.insert_meal` (`meal_time` normalized to UTC ISO via `_iso_to_utc_aware`)
+- `edit` → `db.update_meal` (filters fields to `db.EDITABLE_MEAL_COLUMNS`; rejects None/empty for NOT NULL columns; normalizes any supplied `meal_time`)
 - `delete` → `db.delete_meal`
 
 Pending entries TTL-out after 1h via `_sweep_pending`. If the bot restarts mid-confirmation the entry is lost; the user just re-asks (which now hits the chat path again).
@@ -189,12 +191,12 @@ Paths are hard-coded to `/home/pi/garmin-monitor`; edit `WorkingDirectory`, `Env
 
 ## Gotchas
 
-- **`.env.example` is missing the biometric vars** (`USER_AGE`, `USER_HEIGHT_CM`, `USER_WEIGHT_KG`, `USER_SEX`). They're read by `Config.from_env()` with defaults, so the calorie math will use 30y/175cm/75kg/male unless the operator sets them.
+- **Biometric defaults are 30y/175cm/75kg/male** if the operator skips `USER_AGE` / `USER_HEIGHT_CM` / `USER_WEIGHT_KG` / `USER_SEX` in `.env`. Calorie math (BMR, step kcal, RED-S energy availability) is silently wrong but not broken.
 - **First Garmin login may need MFA.** The poller prompts on stdin via `_prompt_mfa()`, which only works in an interactive TTY. For headless setup, run `python auth_setup.py` once interactively to cache tokens.
 - **TLS fingerprinting:** `python-garminconnect` uses `curl_cffi` to mimic a real browser. If logins start failing, `pip install --upgrade garminconnect curl_cffi` first.
 - **Daily-readiness checks need ~7 days of `daily_summary` history** before they fire — see `*_MIN_BASELINE_SAMPLES`.
 - **DB cleanup after upgrading from a BLE-era install.** This refactor dropped the `hr_realtime` and `hrv` tables. `init-db` won't drop them on existing DBs (`CREATE TABLE IF NOT EXISTS`); the operator can run `sqlite3 garmin.db 'DROP TABLE IF EXISTS hr_realtime; DROP TABLE IF EXISTS hrv; VACUUM;'` once if they want the disk reclaimed.
-- **Bot needs `requirements-bot.txt` installed.** The base install is intentionally Anthropic-free; the bot subcommand fails fast with `ModuleNotFoundError: anthropic` if you skip it.
+- **Bot needs `requirements-bot.txt` installed.** The base install is intentionally Anthropic-free; `build_anthropic_client` raises a clear `RuntimeError` ("anthropic SDK is not installed. … pip install -r requirements-bot.txt") if the SDK isn't on the path. `tests/test_llm.py` uses `pytest.importorskip("anthropic")` so the test suite still runs cleanly on a base install — bot tests are skipped, the rest pass.
 - **Misleading "credit balance" error** — see the Conventions entry. Rule of thumb: Haiku 4.5 succeeds without the prefix and was historically how this bug got missed; if Haiku works but Sonnet/Opus fails on the same OAuth token, suspect a missing system prefix.
 
 ## References
