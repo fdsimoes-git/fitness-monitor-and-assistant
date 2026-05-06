@@ -127,6 +127,17 @@ Pending entries TTL-out after 1h via `_sweep_pending`. If the bot restarts mid-c
 
 `llm.chat()` accepts optional `image_bytes` + `mime_type` and inserts them as a base64 image content block in the user message. The model sees the image alongside any caption text and can call any tool. Asset-management has no vision in chat — this is a Telegram-specific extension. **Image bytes are never persisted** — the buffer is dropped right after the SDK call returns; `tests/test_telegram_bot.py::test_photo_flow_does_not_leak_image_bytes_to_db` enforces this.
 
+#### Conversational history
+
+`run()` keeps a `history: list[{role, content}]` next to `pending` and threads it through `dispatch` → `_handle_text` / `_handle_photo` → `_run_chat`. Each chat-routed turn appends a `(user, assistant)` pair via `_append_history`; the list is trimmed to the last `HISTORY_MAX_PAIRS = 10` pairs (20 entries). `llm.chat()` prepends `history` verbatim to its `messages` list before the current user turn — it never mutates the caller's list.
+
+Two design choices worth knowing:
+
+- **Photo turns store placeholders**, not bytes. After a photo turn, history records `{"role": "user", "content": "[photo] caption_text"}` instead of the original list-with-image-block. This avoids re-sending old image bytes (token-cost) and prevents arbitrary growth in history payload size. Past photos are referenced by their effects (the assistant's prior reply describes what was logged).
+- **Fast-path commands skip history.** `/help`, `/today`, `/balance`, and the numeric-barcode shortcut never touch the list. Only chat-routed messages contribute, so `/help` doesn't flush meaningful context.
+
+History is per-process and lost on restart (matches `pending`'s lifetime). For a single-user Pi bot this is fine; if conversations need to survive restarts, persist to SQLite as a follow-up.
+
 `src/llm.py` mirrors the credential-resolution pattern from `asset-management/server.js` (lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set we use the OAuth route (Bearer token + `anthropic-beta: oauth-2025-04-20` header + a system prefix identifying the request as Claude Code) so calls bill to the user's Claude Code subscription; otherwise we use the standard `ANTHROPIC_API_KEY` route. Default model `claude-sonnet-4-6`; override via `CLAUDE_MODEL`.
 
 **Photo bytes are never persisted.** The byte buffer is passed to Claude in-memory and dropped immediately; nothing is written to disk or SQLite. `tests/test_telegram_bot.py::test_photo_flow_does_not_leak_image_bytes_to_db` enforces this.

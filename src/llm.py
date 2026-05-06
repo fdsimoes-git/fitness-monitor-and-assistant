@@ -684,6 +684,7 @@ def chat(
     *,
     image_bytes: bytes | None = None,
     mime_type: str | None = None,
+    history: list[dict] | None = None,
 ) -> str | None:
     """Run an agentic conversation turn against `CHAT_TOOLS` and return the
     final text answer.
@@ -697,6 +698,13 @@ def chat(
     initial user turn — passed through to Claude as a base64 image content
     block. The bytes are never persisted (the bot drops them after this
     call returns).
+
+    `history` is the conversational context from prior turns — a list of
+    `{role, content}` dicts owned by the caller (the bot keeps a per-process
+    list capped at HISTORY_MAX_PAIRS user/assistant exchanges). It is
+    prepended to the messages list verbatim; this function does NOT mutate
+    it. Past photo turns should be stored as text placeholders by the
+    caller — we deliberately don't re-send image bytes for older turns.
 
     Returns `None` if no credentials, no text in the final reply, or the
     loop exceeds `CHAT_MAX_ITERATIONS`.
@@ -728,7 +736,8 @@ def chat(
     else:
         user_content = user_text
 
-    messages: list[dict] = [{"role": "user", "content": user_content}]
+    messages: list[dict] = list(history or [])
+    messages.append({"role": "user", "content": user_content})
 
     for _ in range(CHAT_MAX_ITERATIONS):
         response = client.messages.create(

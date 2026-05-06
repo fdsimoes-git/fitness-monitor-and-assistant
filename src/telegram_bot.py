@@ -53,6 +53,7 @@ PENDING_TTL_SECONDS = 3600
 INITIAL_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 60.0
 BARCODE_PATTERN = re.compile(r"^\d{8,14}$")
+HISTORY_MAX_PAIRS = 10  # keep the last N user/assistant pairs for context continuity
 
 HELP_TEXT = (
     "*garmin-monitor — fitness & nutrition assistant*\n\n"
@@ -98,13 +99,14 @@ def run(cfg: Config) -> None:
     offset: int | None = None
     backoff = INITIAL_BACKOFF_S
     pending: dict[str, dict[str, Any]] = {}
+    history: list[dict[str, str]] = []
     while True:
         try:
             updates = _get_updates(cfg, offset)
             for u in updates:
                 offset = u["update_id"] + 1
                 try:
-                    dispatch(cfg, u, pending)
+                    dispatch(cfg, u, pending, history)
                 except Exception:  # noqa: BLE001 — never let one update kill the loop
                     log.exception("dispatch error")
             backoff = INITIAL_BACKOFF_S
@@ -138,14 +140,26 @@ def _get_updates(cfg: Config, offset: int | None) -> list[dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def dispatch(cfg: Config, update: dict, pending: dict[str, dict[str, Any]]) -> None:
+def dispatch(
+    cfg: Config,
+    update: dict,
+    pending: dict[str, dict[str, Any]],
+    history: list[dict[str, str]] | None = None,
+) -> None:
     """Top-level update handler. Routes based on update kind and chat-id whitelist.
 
     Sweeps stale `pending` entries once per inbound update — this is the
     single chokepoint that guarantees the dict can't grow unbounded
     regardless of which path (chat, photo, barcode) created the proposal.
+
+    `history` is the bot's per-process conversational context list (owned by
+    `run()`); chat-routed handlers append to it and trim. `None` is
+    accepted for backward compatibility with tests that don't care about
+    history continuity.
     """
     _sweep_pending(pending)
+    if history is None:
+        history = []
     if "callback_query" in update:
         q = update["callback_query"]
         cb_chat = (q.get("message") or {}).get("chat", {}).get("id")
@@ -163,9 +177,9 @@ def dispatch(cfg: Config, update: dict, pending: dict[str, dict[str, Any]]) -> N
         log.warning("Ignoring message from non-whitelisted chat %s", chat_id)
         return
     if "photo" in msg:
-        _handle_photo(cfg, msg, pending)
+        _handle_photo(cfg, msg, pending, history)
     elif "text" in msg:
-        _handle_text(cfg, msg, pending)
+        _handle_text(cfg, msg, pending, history)
 
 
 def _is_whitelisted(cfg: Config, chat_id: Any) -> bool:
@@ -179,12 +193,19 @@ def _is_whitelisted(cfg: Config, chat_id: Any) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _handle_text(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) -> None:
+def _handle_text(
+    cfg: Config,
+    msg: dict,
+    pending: dict[str, dict[str, Any]],
+    history: list[dict[str, str]],
+) -> None:
     text = (msg.get("text") or "").strip()
     if not text:
         return
 
-    # Fast-path commands (deterministic, no Claude call):
+    # Fast-path commands (deterministic, no Claude call). They intentionally
+    # don't append to `history` — the agent only needs to remember
+    # conversational turns, not /help-style shortcuts.
     if text in ("/help", "/start"):
         alerts.send_telegram(cfg, HELP_TEXT)
         return
@@ -197,10 +218,15 @@ def _handle_text(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) -> 
         return
 
     # Default: chat with the full tool surface.
-    _run_chat(cfg, text, pending)
+    _run_chat(cfg, text, pending, history)
 
 
-def _handle_photo(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) -> None:
+def _handle_photo(
+    cfg: Config,
+    msg: dict,
+    pending: dict[str, dict[str, Any]],
+    history: list[dict[str, str]],
+) -> None:
     photos = msg.get("photo") or []
     if not photos:
         return
@@ -210,7 +236,7 @@ def _handle_photo(cfg: Config, msg: dict, pending: dict[str, dict[str, Any]]) ->
         _send_plain(cfg, "Couldn't download that photo from Telegram.")
         return
     caption = (msg.get("caption") or "").strip()
-    _run_chat(cfg, caption, pending, image_bytes=image_bytes, mime_type=mime_type)
+    _run_chat(cfg, caption, pending, history, image_bytes=image_bytes, mime_type=mime_type)
     # Reference released here; no persistence anywhere.
     del image_bytes
 
@@ -219,17 +245,24 @@ def _run_chat(
     cfg: Config,
     user_text: str,
     pending: dict[str, dict[str, Any]],
+    history: list[dict[str, str]],
     *,
     image_bytes: bytes | None = None,
     mime_type: str | None = None,
 ) -> None:
     """Dispatch to llm.chat() and surface a Confirm/Cancel keyboard for any
     write proposals it parked in `pending`. The chat reply (when present) is
-    sent first; keyboards follow."""
+    sent first; keyboards follow.
+
+    Appends a (user, assistant) pair to `history` so the next turn sees the
+    prior context. Past photo turns are stored as text placeholders — we
+    deliberately don't replay image bytes for older turns (token-cost +
+    diminishing relevance after the first reasoning pass)."""
     pending_before = set(pending.keys())
     answer = llm.chat(
         cfg, user_text, pending,
         image_bytes=image_bytes, mime_type=mime_type,
+        history=history,
     )
     new_pids = [pid for pid in pending if pid not in pending_before]
 
@@ -247,6 +280,31 @@ def _run_chat(
 
     for pid in new_pids:
         _surface_pending(cfg, pid, pending[pid])
+
+    _append_history(history, user_text, answer, has_image=image_bytes is not None)
+
+
+def _append_history(
+    history: list[dict[str, str]],
+    user_text: str,
+    answer: str | None,
+    *,
+    has_image: bool,
+) -> None:
+    """Append one user/assistant pair to `history` and trim to HISTORY_MAX_PAIRS."""
+    if has_image:
+        # Replace bytes with a text placeholder so future turns don't re-send.
+        # If the user supplied a caption, keep it after the marker.
+        historical_user = f"[photo] {user_text}".strip() if user_text else "[photo]"
+    else:
+        historical_user = user_text
+    historical_assistant = answer or "(proposed action — awaiting user confirmation)"
+    history.append({"role": "user", "content": historical_user})
+    history.append({"role": "assistant", "content": historical_assistant})
+    # Trim to the last HISTORY_MAX_PAIRS pairs (each pair = 2 messages).
+    excess = len(history) - HISTORY_MAX_PAIRS * 2
+    if excess > 0:
+        del history[:excess]
 
 
 def _propose_barcode(cfg: Config, barcode: str, pending: dict[str, dict[str, Any]]) -> None:

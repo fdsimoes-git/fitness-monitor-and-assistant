@@ -354,6 +354,119 @@ def test_callback_expired_pending_replies_gracefully(tmpdb):
 # ── pending TTL sweep ─────────────────────────────────────────────────────
 
 
+# ── chat history ──────────────────────────────────────────────────────────
+
+
+def test_chat_history_grows_on_each_chat_turn(tmpdb):
+    """Plain text → chat appends a (user, assistant) pair to history."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+    with patch("src.telegram_bot.llm.chat", return_value="Got it.") as mock_chat, \
+         patch("src.telegram_bot._send_plain"):
+        telegram_bot.dispatch(cfg, _msg(text="hello"), pending, history)
+    # The chat call received the (initially empty) history.
+    assert mock_chat.call_args.kwargs["history"] is history
+    # After the call, history grew by exactly one user/assistant pair.
+    assert history == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "Got it."},
+    ]
+
+
+def test_chat_history_caps_at_10_pairs(tmpdb):
+    """Adding more than HISTORY_MAX_PAIRS pairs trims the oldest."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    # Pre-fill with 10 pairs (= 20 messages).
+    history: list[dict] = []
+    for i in range(10):
+        history.append({"role": "user", "content": f"old user {i}"})
+        history.append({"role": "assistant", "content": f"old assistant {i}"})
+
+    with patch("src.telegram_bot.llm.chat", return_value="new reply"), \
+         patch("src.telegram_bot._send_plain"):
+        telegram_bot.dispatch(cfg, _msg(text="new user msg"), pending, history)
+
+    assert len(history) == telegram_bot.HISTORY_MAX_PAIRS * 2
+    # Oldest pair was evicted; newest is at the end.
+    assert history[0] == {"role": "user", "content": "old user 1"}
+    assert history[-2] == {"role": "user", "content": "new user msg"}
+    assert history[-1] == {"role": "assistant", "content": "new reply"}
+
+
+def test_chat_history_stores_photo_as_placeholder_not_bytes(tmpdb):
+    """Photo turns must NOT push image bytes into history — only a text placeholder."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+    with patch("src.telegram_bot._download_telegram_file", return_value=(b"\x89PNGfake" * 1000, "image/png")), \
+         patch("src.telegram_bot.llm.chat", return_value="Looks like pasta.") as mock_chat, \
+         patch("src.telegram_bot._send_plain"):
+        telegram_bot.dispatch(
+            cfg,
+            _msg(photo=[{"file_id": "fid", "file_size": 100}], caption="lunch"),
+            pending,
+            history,
+        )
+    # llm.chat saw the bytes — that's expected.
+    assert mock_chat.call_args.kwargs["image_bytes"] is not None
+    # But history must hold ONLY text — no bytes anywhere.
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "[photo] lunch"
+    assert isinstance(history[0]["content"], str)
+    assert history[1]["content"] == "Looks like pasta."
+
+
+def test_chat_history_records_placeholder_when_no_text_reply(tmpdb):
+    """Model went straight to a write tool with no text — history still gets a paired entry."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+
+    def fake_chat(cfg_, text, p, **kw):
+        p["abc"] = {
+            "action": "insert",
+            "meal": {"description": "oats", "kcal": 350},
+            "ts": time.time(),
+        }
+        return None  # silent: model only made a tool call
+
+    with patch("src.telegram_bot.llm.chat", side_effect=fake_chat), \
+         patch("src.telegram_bot._send_plain"), \
+         patch("src.telegram_bot._send_with_keyboard"):
+        telegram_bot.dispatch(cfg, _msg(text="oats 350"), pending, history)
+
+    assert history == [
+        {"role": "user", "content": "oats 350"},
+        {"role": "assistant", "content": "(proposed action — awaiting user confirmation)"},
+    ]
+
+
+def test_help_today_balance_and_barcode_do_not_pollute_history(tmpdb):
+    """Fast-path commands shouldn't leak into chat history."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+
+    with patch("src.telegram_bot.alerts.send_telegram"), \
+         patch("src.telegram_bot.db.calorie_balance_for_date") as mock_bal:
+        mock_bal.return_value = {
+            "date": "2026-05-05", "eaten_kcal": 0, "burned_kcal": 0,
+            "bmr_kcal": 0, "steps_burned_kcal": 0, "total_burned_kcal": 0,
+            "balance_kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0,
+            "meal_count": 0,
+        }
+        telegram_bot.dispatch(cfg, _msg(text="/help"), pending, history)
+        telegram_bot.dispatch(cfg, _msg(text="/today"), pending, history)
+        telegram_bot.dispatch(cfg, _msg(text="/balance"), pending, history)
+    with patch("src.telegram_bot.food.lookup_barcode", return_value=None), \
+         patch("src.telegram_bot._send_plain"):
+        telegram_bot.dispatch(cfg, _msg(text="9999999999"), pending, history)
+
+    assert history == []
+
+
 def test_dispatch_sweeps_stale_pending_entries(tmpdb):
     """Every inbound update triggers a TTL sweep — even ones that originated
     from the chat path (which used to skip _sweep_pending entirely)."""

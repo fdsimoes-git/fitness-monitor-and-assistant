@@ -498,6 +498,57 @@ def test_chat_provides_default_caption_when_image_only():
     assert "log" in text_blocks[0]["text"].lower()
 
 
+def test_chat_prepends_history_before_the_new_user_turn():
+    """When `history` is supplied, chat() prepends every entry verbatim and the
+    new user message goes last."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("Found two — porridge and pasta.")],
+        stop_reason="end_turn",
+    )
+    history = [
+        {"role": "user", "content": "what did I eat yesterday?"},
+        {"role": "assistant", "content": "Porridge at 08:00 and pasta at 19:30."},
+    ]
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        out = llm.chat(cfg, "what about today?", {}, history=history)
+    assert out == "Found two — porridge and pasta."
+    sent = fake_client.messages.create.call_args.kwargs["messages"]
+    # Prior history first, then the new user message — exactly 3 entries.
+    assert len(sent) == 3
+    assert sent[0] == history[0]
+    assert sent[1] == history[1]
+    assert sent[2] == {"role": "user", "content": "what about today?"}
+    # And we did NOT mutate the caller's history list.
+    assert history == [
+        {"role": "user", "content": "what did I eat yesterday?"},
+        {"role": "assistant", "content": "Porridge at 08:00 and pasta at 19:30."},
+    ]
+
+
+def test_chat_with_history_and_image_sends_image_only_for_current_turn():
+    """Past photo turns should already be string placeholders; chat() doesn't
+    add image content blocks to historical turns."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("ok")], stop_reason="end_turn",
+    )
+    history = [
+        {"role": "user", "content": "[photo] my last lunch"},
+        {"role": "assistant", "content": "Logged: pasta — 600 kcal."},
+    ]
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        llm.chat(cfg, "compare to today", {}, image_bytes=b"\x89PNG", mime_type="image/png", history=history)
+    sent = fake_client.messages.create.call_args.kwargs["messages"]
+    # Past placeholder is plain text — no image block.
+    assert sent[0]["content"] == "[photo] my last lunch"
+    # Current turn has the image content list.
+    assert isinstance(sent[-1]["content"], list)
+    assert any(c.get("type") == "image" for c in sent[-1]["content"])
+
+
 def test_chat_full_log_meal_loop_parks_pending(tmpdb_cfg):
     """End-to-end through the agentic loop: model calls log_meal, tool stashes pending, model summarises."""
     from src import db as _db
