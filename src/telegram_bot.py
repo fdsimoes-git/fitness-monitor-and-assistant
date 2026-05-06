@@ -326,7 +326,11 @@ def _run_chat(
     for pid in new_pids:
         _surface_pending(cfg, pid, pending[pid])
 
-    _append_history(history, user_text, answer, has_image=image_bytes is not None)
+    _append_history(
+        history, user_text, answer,
+        has_image=image_bytes is not None,
+        proposed_count=len(new_pids),
+    )
 
 
 def _append_history(
@@ -335,8 +339,21 @@ def _append_history(
     answer: str | None,
     *,
     has_image: bool,
+    proposed_count: int = 0,
 ) -> None:
-    """Append one user/assistant pair to `history` and trim to HISTORY_MAX_PAIRS."""
+    """Append one user/assistant pair to `history` and trim to HISTORY_MAX_PAIRS.
+
+    Three cases for the assistant turn:
+    - Real text reply → recorded verbatim.
+    - No text but ≥1 proposal parked → "(proposed action — awaiting user
+      confirmation)" placeholder so the model knows next turn that
+      something is in flight.
+    - No text and no proposals (Claude unreachable, hard error, etc.) →
+      skip the entire append. A failed turn shouldn't pollute history with
+      a misleading "proposed action" string.
+    """
+    if not answer and proposed_count == 0:
+        return  # failed turn — don't write anything to history
     if has_image:
         # Replace bytes with a text placeholder so future turns don't re-send.
         # If the user supplied a caption, keep it after the marker.
@@ -458,7 +475,16 @@ def _handle_callback(
         return
 
     if action == "confirm":
-        ack, summary = _apply_pending(cfg, entry)
+        # _apply_pending hits the DB; if SQLite is full, the schema is in a
+        # weird state, or insert_meal raises for any reason, we still owe
+        # Telegram an answerCallbackQuery (otherwise the spinner hangs) AND
+        # the user a clear error message in place of the keyboard. Wrap.
+        try:
+            ack, summary = _apply_pending(cfg, entry)
+        except Exception as e:  # noqa: BLE001 — never let a write failure orphan the callback
+            log.exception("_apply_pending raised on %s pid=%s", entry.get("action"), pid)
+            ack = "Failed"
+            summary = f"⚠️ Couldn't apply that change: {e}"
         _answer_callback(cfg, callback_id, ack)
         if chat_id and msg_id:
             _edit_message_remove_keyboard(cfg, chat_id, msg_id, summary)

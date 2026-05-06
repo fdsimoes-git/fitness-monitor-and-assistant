@@ -349,6 +349,27 @@ def test_callback_cancel_drops_pending_without_writing(tmpdb):
     assert "Cancelled" in mock_edit.call_args.args[3]
 
 
+def test_callback_confirm_recovers_when_apply_pending_raises(tmpdb):
+    """If db.insert_meal blows up under a confirmed proposal, the bot must still
+    answer the callback (no hung spinner) and edit the keyboard into a clear
+    failure message — no exception escapes _handle_callback."""
+    cfg = _make_cfg(tmpdb)
+    pending = {"abc123": {
+        "action": "insert",
+        "meal": {"description": "salmon", "kcal": 500, "source": "ai"},
+        "ts": time.time(),
+    }}
+    with patch("src.telegram_bot.db.insert_meal", side_effect=RuntimeError("disk full")), \
+         patch("src.telegram_bot._answer_callback") as mock_ack, \
+         patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit:
+        # Should NOT raise.
+        telegram_bot.dispatch(cfg, _callback("confirm:abc123"), pending)
+    mock_ack.assert_called_once()
+    assert mock_ack.call_args.args[2] == "Failed"
+    mock_edit.assert_called_once()
+    assert "disk full" in mock_edit.call_args.args[3]
+
+
 def test_callback_unknown_action_does_not_drop_pending_entry(tmpdb):
     """Bad callback data must not consume a still-valid pending proposal."""
     cfg = _make_cfg(tmpdb)
@@ -529,6 +550,19 @@ def test_chat_history_stores_photo_as_placeholder_not_bytes(tmpdb):
     assert history[0]["content"] == "[photo] lunch"
     assert isinstance(history[0]["content"], str)
     assert history[1]["content"] == "Looks like pasta."
+
+
+def test_chat_history_skips_failed_turns_entirely(tmpdb):
+    """When chat returns no text AND no new proposals, history must not get a
+    misleading 'proposed action' placeholder — the failed turn is dropped."""
+    cfg = _make_cfg(tmpdb)
+    pending: dict[str, dict] = {}
+    history: list[dict] = []
+    with patch("src.telegram_bot.llm.chat", return_value=None), \
+         patch("src.telegram_bot._send_status", return_value=None), \
+         patch("src.telegram_bot._send_plain"):
+        telegram_bot.dispatch(cfg, _msg(text="hello"), pending, history)
+    assert history == []
 
 
 def test_chat_history_records_placeholder_when_no_text_reply(tmpdb):

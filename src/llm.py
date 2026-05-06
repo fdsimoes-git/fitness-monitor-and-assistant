@@ -524,6 +524,16 @@ CHAT_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+# Allowed keys for the `log_meal` tool's `meal` payload. Mirrors the
+# `RECORD_MEAL_TOOL` input_schema — anything outside this set the model
+# might send (e.g. `id`, `logged_at`, `raw_json`) is silently dropped.
+_LOG_MEAL_WRITE_FIELDS = frozenset({
+    "description", "kcal", "protein_g", "carbs_g", "fat_g",
+    "fiber_g", "sugars_g", "saturated_fat_g", "sodium_mg",
+    "food_category", "meal_time",
+})
+
+
 def _execute_chat_tool(
     name: str,
     input_data: dict,
@@ -585,10 +595,14 @@ def _execute_chat_tool(
 
     # ── Write tools (validate-and-stash) ──────────────────────────────────
     if name == "log_meal":
-        meal = {k: v for k, v in input_data.items()}
+        # Whitelist keys to the RECORD_MEAL_TOOL schema. Drops anything the
+        # model might send by accident (`id`, `logged_at`, `raw_json`, etc.)
+        # and keeps the proposal payload faithful to the contract — defense
+        # in depth on top of db.insert_meal's own column-by-column build.
+        meal = {k: v for k, v in input_data.items() if k in _LOG_MEAL_WRITE_FIELDS}
         if "description" not in meal or "kcal" not in meal:
             return {"error": "log_meal requires description and kcal"}
-        meal.setdefault("source", "ai")
+        meal["source"] = "ai"  # always tag chat-driven logs; never trust input
         return _stash_pending(pending, action="insert", meal=meal)
 
     if name == "edit_meal":

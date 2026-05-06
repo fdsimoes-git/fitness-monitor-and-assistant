@@ -380,6 +380,39 @@ def test_log_meal_tool_parks_in_pending_without_writing(tmpdb_cfg):
     assert _db.meals_for_date(tmpdb_cfg.db_path, date.today().isoformat()) == []
 
 
+def test_log_meal_tool_drops_unexpected_keys_from_input(tmpdb_cfg):
+    """Defense in depth: model-supplied keys outside RECORD_MEAL_TOOL's schema
+    must be dropped before the proposal is parked, AND `source` must be
+    forced to 'ai' regardless of what the model sent."""
+    pending: dict[str, dict] = {}
+    out = llm._execute_chat_tool(
+        "log_meal",
+        {
+            "description": "oats",
+            "kcal": 350,
+            "id": 9999,           # ← attempted spoofing
+            "logged_at": "2020-01-01",  # ← reserved column
+            "raw_json": "{...}",  # ← would let raw input leak
+            "source": "evil",     # ← model-supplied source
+            "garbage": "nope",
+        },
+        tmpdb_cfg, pending,
+    )
+    assert "pending_id" in out
+    pid = out["pending_id"]
+    parked = pending[pid]["meal"]
+    # Allowed keys present.
+    assert parked["description"] == "oats"
+    assert parked["kcal"] == 350
+    # Unexpected keys dropped.
+    assert "id" not in parked
+    assert "logged_at" not in parked
+    assert "raw_json" not in parked
+    assert "garbage" not in parked
+    # `source` always overridden to "ai" — never trust input.
+    assert parked["source"] == "ai"
+
+
 def test_log_meal_tool_rejects_missing_required_fields(tmpdb_cfg):
     pending: dict[str, dict] = {}
     out = llm._execute_chat_tool("log_meal", {"description": "oats"}, tmpdb_cfg, pending)
