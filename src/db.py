@@ -212,9 +212,19 @@ def insert_meal(db_path: Path, meal: dict) -> int:
     if not meal.get("source"):
         raise ValueError("insert_meal requires source")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Normalize meal_time to UTC ISO so the column shape is consistent
+    # regardless of whether the model passed a tz-aware ISO or a naive one
+    # (Claude tool calls sometimes return naive timestamps because the
+    # system prompt frames "today" in Pi-local terms). _iso_to_utc_aware
+    # treats naive as local — the user's likely intent — and converts.
+    raw_meal_time = meal.get("meal_time") or now
+    try:
+        meal_time = _iso_to_utc_aware(raw_meal_time).isoformat(timespec="seconds")
+    except (TypeError, ValueError):
+        meal_time = now  # fall back rather than blocking the insert
     values = {
         "logged_at": now,
-        "meal_time": meal.get("meal_time") or now,
+        "meal_time": meal_time,
         "description": meal["description"],
         "source": meal["source"],
         "barcode": meal.get("barcode"),
@@ -542,6 +552,22 @@ def whole_food_pct(db_path: Path, date_iso: str) -> float | None:
     return round((total - discretionary) / total, 3)
 
 
+def _iso_to_utc_aware(iso_str: str) -> datetime:
+    """Parse an ISO timestamp string to a UTC-aware datetime.
+
+    The schema declares `meal_time` as UTC ISO, but in practice Claude tool
+    calls sometimes return naive timestamps (no tz suffix) because the model
+    is reasoning in Pi-local time under the "Today is …" system prompt.
+    Treat naive values as local time (the most likely intent), then convert
+    to UTC. This makes downstream math (`datetime.now(utc) - x`) safe
+    regardless of which shape is in storage.
+    """
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # interpret naive as system local
+    return dt.astimezone(timezone.utc)
+
+
 def meal_timing_summary(db_path: Path, date_iso: str) -> dict | None:
     """First/last meal of the day and the gap from last meal to now.
 
@@ -550,13 +576,12 @@ def meal_timing_summary(db_path: Path, date_iso: str) -> dict | None:
     meals = meals_for_date(db_path, date_iso)
     if not meals:
         return None
-    first_iso = meals[0]["meal_time"]
-    last_iso = meals[-1]["meal_time"]
-    first_dt = datetime.fromisoformat(first_iso).astimezone()
-    last_dt = datetime.fromisoformat(last_iso).astimezone()
+    first_dt = _iso_to_utc_aware(meals[0]["meal_time"]).astimezone()  # display in local
+    last_dt = _iso_to_utc_aware(meals[-1]["meal_time"]).astimezone()
     eating_window_h = round((last_dt - first_dt).total_seconds() / 3600.0, 2)
     fasting_h_since_last = round(
-        (datetime.now(timezone.utc) - datetime.fromisoformat(last_iso)).total_seconds() / 3600.0,
+        (datetime.now(timezone.utc) - _iso_to_utc_aware(meals[-1]["meal_time"])).total_seconds()
+        / 3600.0,
         2,
     )
     return {

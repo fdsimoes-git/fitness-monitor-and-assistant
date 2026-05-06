@@ -125,6 +125,58 @@ def test_whole_food_pct_unknown_category_counts_as_whole(tmpdb):
     assert db.whole_food_pct(tmpdb, today) == 1.0
 
 
+def test_meal_timing_summary_handles_naive_iso_meal_times(tmpdb):
+    """Regression for the dashboard HTTP-500 caused by Claude returning
+    tz-less meal_time strings. meal_timing_summary used to subtract a
+    UTC-aware now() from a naive fromisoformat() result and raise
+    TypeError. Now naive ISOs are treated as local, normalized, and the
+    subtraction is safe."""
+    today = date.today()
+    today_iso = today.isoformat()
+    # Insert two meals via raw SQL so we keep the tz-less shape (insert_meal
+    # would normalize them on the way in — that's the other half of the fix).
+    import sqlite3
+    naive_breakfast = f"{today_iso}T08:00:00"
+    naive_dinner = f"{today_iso}T19:30:00"
+    now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with sqlite3.connect(tmpdb) as conn:
+        for naive in (naive_breakfast, naive_dinner):
+            conn.execute(
+                "INSERT INTO meals (logged_at, meal_time, description, source, kcal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (now_utc, naive, "x", "manual", 100),
+            )
+        conn.commit()
+    # Should not raise.
+    out = db.meal_timing_summary(tmpdb, today_iso)
+    assert out is not None
+    assert out["meal_count"] == 2
+    assert out["eating_window_h"] > 0
+    assert "hours_since_last_meal" in out
+
+
+def test_insert_meal_normalizes_naive_meal_time_to_utc(tmpdb):
+    """Defense in depth: when Claude tool input comes in with a tz-less ISO,
+    insert_meal normalizes to a UTC-aware ISO with a tz suffix so the column
+    is always consistent going forward."""
+    naive = "2026-05-06T13:28:00"
+    db.insert_meal(tmpdb, {
+        "description": "lunch",
+        "source": "ai",
+        "kcal": 600,
+        "meal_time": naive,
+    })
+    import sqlite3
+    with sqlite3.connect(tmpdb) as conn:
+        rows = conn.execute("SELECT meal_time FROM meals ORDER BY id DESC LIMIT 1").fetchall()
+    stored = rows[0][0]
+    # Stored value carries a tz suffix — either "+HH:MM" or "Z".
+    assert stored.endswith(("+00:00", "Z")) or "+" in stored[10:] or "-" in stored[10:]
+    # And it round-trips through the ISO parser as a tz-aware datetime.
+    parsed = datetime.fromisoformat(stored)
+    assert parsed.tzinfo is not None
+
+
 def test_meal_timing_summary_returns_none_when_empty(tmpdb):
     assert db.meal_timing_summary(tmpdb, date.today().isoformat()) is None
 
