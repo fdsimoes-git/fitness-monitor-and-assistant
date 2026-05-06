@@ -268,8 +268,7 @@ def test_daily_readiness_history_returns_one_per_day(tmpdb):
     cfg = _make_cfg(tmpdb)
     out = db.daily_readiness_history(tmpdb, days=7, cfg=cfg)
     assert len(out) == 7
-    # Production helper anchors on UTC; use UTC here too so the test doesn't
-    # flake when the local timezone and UTC disagree on what "today" is.
-    from datetime import datetime, timezone
-    today = datetime.now(timezone.utc).date().isoformat()
+    # Production now anchors on Pi-local 'today' (db._local_today), so this
+    # plain `date.today()` matches and is no longer UTC-flaky.
+    today = date.today().isoformat()
     assert out[-1]["date"] == today

@@ -73,6 +73,23 @@ CREATE INDEX IF NOT EXISTS idx_meals_meal_time ON meals(meal_time);
 """
 
 
+def _local_today() -> date:
+    """The Pi's local 'today'.
+
+    The codebase has a deliberate split: timestamps are stored in UTC (they
+    represent the absolute moment something happened — never lie about
+    that), but day-bucketing for queries follows the user's local timezone.
+    Most date columns in this DB are local-formatted:
+    - `daily_summary.date` — written by the poller as `date.today().isoformat()`
+    - `activities.date` — derived from Garmin's `startTimeLocal[:10]`
+    Helpers that compare against those columns therefore must use local
+    "today", not UTC's. UTC and local can disagree by a calendar day around
+    midnight, which previously caused the dashboard's 7-day balance and
+    year heatmap to show next-day entries during late evening on UTC-3+.
+    """
+    return date.today()
+
+
 @contextmanager
 def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +179,9 @@ def upsert_activity(db_path: Path, fields: dict) -> None:
 
 def recent_activities(db_path: Path, days: int = 7) -> list[dict]:
     """Return activities with `date` within the last `days` days, newest first."""
-    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    # `activities.date` is local-formatted (Garmin's startTimeLocal[:10]),
+    # so the cutoff must be Pi-local — not UTC.
+    cutoff = (_local_today() - timedelta(days=days)).isoformat()
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -414,8 +433,10 @@ def prune_old_data(con: sqlite3.Connection, days: int = 90) -> dict[str, int]:
     daily_summary and alerts are kept forever (one row per day, tiny).
     Returns a dict of table_name -> rows deleted.
     """
+    # `meal_time` is stored as a UTC ISO timestamp → cutoff must be UTC.
+    # `activities.date` is local-formatted → cutoff must be Pi-local.
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
-    cutoff_date = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    cutoff_date = (_local_today() - timedelta(days=days)).isoformat()
     deleted: dict[str, int] = {}
     cur = con.execute("DELETE FROM activities WHERE date < ?", (cutoff_date,))
     deleted["activities"] = cur.rowcount or 0
@@ -548,9 +569,10 @@ def recent_calorie_balance(db_path: Path, days: int, cfg) -> list[dict]:
     """[{date, balance_kcal}] for the last `days` calendar days, oldest first.
 
     Pulls the per-day balance via `calorie_balance_for_date` so the math stays
-    consistent with the CLI / dashboard output.
+    consistent with the CLI / dashboard output. Anchored on Pi-local "today"
+    to match the rest of the codebase (see `_local_today`).
     """
-    today = datetime.now(timezone.utc).date()
+    today = _local_today()
     out: list[dict] = []
     for offset in range(days - 1, -1, -1):
         d = (today - timedelta(days=offset)).isoformat()
@@ -661,8 +683,10 @@ def daily_readiness_history(db_path: Path, days: int, cfg) -> list[dict]:
     """[{date, score}] for the last `days` days ending today, oldest first.
 
     Skips days where the score is None (no data) — caller renders empty cells.
+    Anchored on Pi-local "today" so the heatmap's most recent cell stays
+    aligned with what the user calls "today" (see `_local_today`).
     """
-    today = datetime.now(timezone.utc).date()
+    today = _local_today()
     out: list[dict] = []
     for offset in range(days - 1, -1, -1):
         d = (today - timedelta(days=offset)).isoformat()

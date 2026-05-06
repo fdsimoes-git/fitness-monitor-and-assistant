@@ -67,6 +67,15 @@ Each check has a minimum-samples floor (`*_MIN_BASELINE_SAMPLES`) so a fresh DB 
 
 `get_activities(0, 10)` is called once per poll and rows are deduped via `upsert_activity` keyed on `activity_id`.
 
+### Time convention: UTC for storage, Pi-local for day-bucketing
+
+Two clocks coexist deliberately:
+
+- **Storage timestamps** (`*.ts`, `meals.meal_time`, `daily_summary.fetched_at`, `alerts.ts`, etc.) are written as ISO-8601 UTC strings — they record the absolute moment something happened and must never lie about that.
+- **Day-bucketing** (`daily_summary.date`, `activities.date`, the chat assistant's "today", any `WHERE date = …` query) follows the **Pi's local timezone**. Most date columns are stored as local YYYY-MM-DD strings (e.g. `daily_summary.date` is `date.today().isoformat()` from the poller; `activities.date` is `Garmin.startTimeLocal[:10]`).
+
+The mismatch breaks near midnight UTC: ask `/today` at 22:30 local UTC-3 (= 01:30 UTC next day), and a UTC-anchored query returns "tomorrow"'s row while the user means today. Use `db._local_today()` for any "what local day is it?" calculation; reserve `datetime.now(timezone.utc)` for full timestamps. Four call-sites (`recent_activities`, `prune_old_data`'s activities cutoff, `recent_calorie_balance`, `daily_readiness_history`) historically used UTC and are now corrected — `tests/test_nutrition.py::test_recent_calorie_balance_anchors_on_local_today` (and friends) regression-test the convention.
+
 ### Schema lives in `src/db.py:SCHEMA`; migrations are minimal
 
 `init_db()` runs the full `CREATE TABLE IF NOT EXISTS` script, then `_migrate()` for any post-hoc column adds (currently `alerts.message`). When adding columns, append to `_migrate()` with a column-existence check — don't rewrite SCHEMA assuming the user re-creates the DB.
