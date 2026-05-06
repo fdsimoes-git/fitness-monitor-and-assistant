@@ -32,15 +32,26 @@ def _no_real_telegram_http(monkeypatch):
     api.telegram.org. Individual tests can still re-patch any of these to
     assert behavior; this fixture only protects tests that don't explicitly
     care about a given helper.
+
+    NOTE: `_edit_message_remove_keyboard` is intentionally NOT stubbed here —
+    every test that exercises the callback path patches it explicitly
+    (asserting the keyboard-clearing behavior is part of the contract), and
+    leaving it un-stubbed lets `test_edit_message_remove_keyboard_clears_inline_keyboard`
+    exercise the real implementation against a mocked requests.post. As
+    belt-and-braces, we also stub `requests.post` so any code path that
+    forgets to patch a helper still can't reach the network.
     """
     monkeypatch.setattr("src.telegram_bot._send_typing", lambda cfg: None)
     monkeypatch.setattr("src.telegram_bot._send_status", lambda cfg, text: 1)
     monkeypatch.setattr("src.telegram_bot._edit_status", lambda cfg, msg_id, text: None)
     monkeypatch.setattr("src.telegram_bot._delete_message", lambda cfg, msg_id: None)
     monkeypatch.setattr("src.telegram_bot._answer_callback", lambda cfg, cid, text: None)
+    # Catch-all: even if a helper isn't stubbed, no test gets to api.telegram.org.
     monkeypatch.setattr(
-        "src.telegram_bot._edit_message_remove_keyboard",
-        lambda cfg, chat_id, msg_id, text: None,
+        "src.telegram_bot.requests.post",
+        lambda *a, **kw: type("R", (), {"raise_for_status": lambda self: None,
+                                         "json": lambda self: {"ok": True, "result": {}},
+                                         "content": b""})(),
     )
 
 
@@ -118,6 +129,47 @@ def test_help_command_sends_help_text(tmpdb):
     text = mock_send.call_args.args[1]
     assert "fitness & nutrition" in text
     mock_chat.assert_not_called()
+
+
+def test_today_command_routes_through_db_local_today(tmpdb):
+    """The /today fast path must use db.local_today (the patchable seam)
+    rather than calling date.today() directly."""
+    cfg = _make_cfg(tmpdb)
+    from datetime import date as _date
+    fake_today = _date(2026, 5, 5)
+    with patch("src.telegram_bot.db.local_today", return_value=fake_today) as mock_local, \
+         patch("src.telegram_bot.db.calorie_balance_for_date") as mock_bal, \
+         patch("src.telegram_bot.alerts.send_telegram"):
+        mock_bal.return_value = {
+            "date": "2026-05-05", "eaten_kcal": 0, "burned_kcal": 0,
+            "bmr_kcal": 0, "steps_burned_kcal": 0, "total_burned_kcal": 0,
+            "balance_kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0,
+            "meal_count": 0,
+        }
+        telegram_bot.dispatch(cfg, _msg(text="/today"), {})
+    mock_local.assert_called_once()
+    # And the date string handed to calorie_balance_for_date came from local_today.
+    assert mock_bal.call_args.args[1] == "2026-05-05"
+
+
+def test_edit_message_remove_keyboard_clears_inline_keyboard(tmpdb):
+    """Telegram keeps the existing reply_markup unless an explicit
+    replacement is sent. The helper must pass {"inline_keyboard": []} so
+    Confirm/Cancel buttons stop being clickable after the user already
+    chose one — otherwise stale taps trigger 'Expired' callbacks."""
+    cfg = _make_cfg(tmpdb)
+    captured = {}
+
+    def capture(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return type("R", (), {"raise_for_status": lambda self: None})()
+
+    with patch("src.telegram_bot.requests.post", side_effect=capture):
+        telegram_bot._edit_message_remove_keyboard(cfg, 42, 99, "Done.")
+    assert captured["url"].endswith("/editMessageText")
+    assert captured["json"]["text"] == "Done."
+    assert captured["json"]["reply_markup"] == {"inline_keyboard": []}
 
 
 def test_today_command_uses_fast_path_not_chat(tmpdb):

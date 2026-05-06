@@ -32,7 +32,6 @@ import logging
 import re
 import time
 import uuid
-from datetime import date
 from typing import Any
 
 import requests
@@ -229,7 +228,10 @@ def _handle_text(
         alerts.send_telegram(cfg, HELP_TEXT)
         return
     if text in ("/today", "/balance"):
-        bal = db.calorie_balance_for_date(cfg.db_path, date.today().isoformat(), cfg=cfg)
+        # Route through db.local_today so /today and /balance share the same
+        # patchable seam as the rest of the day-bucketing code (and stay
+        # consistent if the helper ever changes).
+        bal = db.calorie_balance_for_date(cfg.db_path, db.local_today().isoformat(), cfg=cfg)
         alerts.send_telegram(cfg, _format_balance(bal))
         return
     if BARCODE_PATTERN.match(text):
@@ -666,11 +668,24 @@ def _answer_callback(cfg: Config, callback_id: str | None, text: str) -> None:
 def _edit_message_remove_keyboard(
     cfg: Config, chat_id: Any, msg_id: Any, new_text: str
 ) -> None:
+    """Edit the message body AND drop its inline keyboard in one call.
+
+    Telegram retains the existing reply_markup unless you explicitly send a
+    new one — omitting the field is *not* the same as clearing it. So we
+    pass an empty inline_keyboard array; without this the Confirm/Cancel
+    buttons stayed clickable after the user already tapped one and the
+    server already wrote (or skipped) the row.
+    """
     api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
     try:
         requests.post(
             f"{api}/editMessageText",
-            json={"chat_id": chat_id, "message_id": msg_id, "text": new_text},
+            json={
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": new_text,
+                "reply_markup": {"inline_keyboard": []},
+            },
             timeout=10,
         )
     except Exception as e:  # noqa: BLE001

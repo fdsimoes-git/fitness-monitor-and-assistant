@@ -787,7 +787,9 @@ def chat(
 
     client = build_anthropic_client(auth)
     system = build_system_prompt(
-        auth, _CHAT_SYSTEM_TEMPLATE.format(today=date.today().isoformat())
+        # Anchor "today" through db.local_today so the model's date
+        # reasoning shares the same patchable seam as the tool dispatcher.
+        auth, _CHAT_SYSTEM_TEMPLATE.format(today=db.local_today().isoformat())
     )
 
     if image_bytes is not None:

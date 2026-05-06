@@ -538,6 +538,47 @@ def test_lookup_barcode_tool_returns_error_on_miss(tmpdb_cfg):
     assert "error" in out
 
 
+def test_lookup_barcode_tool_handles_string_grams_from_model(tmpdb_cfg):
+    """Defense in depth: the model may pass grams as a string ('100') instead
+    of a number; meal_from_barcode_info must coerce instead of crashing."""
+    info = {
+        "name": "Acme Bar", "kcal_100g": 400, "protein_100g": 5, "carbs_100g": 60,
+        "fat_100g": 14, "fiber_100g": 3, "sugars_100g": 35, "saturated_fat_100g": 8,
+        "sodium_mg_100g": 80, "food_category": "Sugary snacks", "serving_size_g": 50,
+    }
+    with patch("src.llm.food.lookup_barcode", return_value=info):
+        out = llm._execute_chat_tool(
+            "lookup_barcode",
+            {"barcode": "1234567890123", "grams": "30"},  # ← stringly-typed
+            tmpdb_cfg, {},
+        )
+    assert "error" not in out
+    # 30g → factor 0.3 → kcal 400*0.3 = 120
+    assert out["kcal"] == 120
+
+
+def test_chat_system_prompt_uses_db_local_today():
+    """The 'Today is {today}' line in the chat system prompt must be sourced
+    from db.local_today so prompt-time and tool-time agree on what 'today' is."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("ok")], stop_reason="end_turn",
+    )
+    from datetime import date as _date
+    fake_today = _date(2026, 5, 5)
+    with patch("src.llm.build_anthropic_client", return_value=fake_client), \
+         patch("src.llm.db.local_today", return_value=fake_today) as mock_local:
+        llm.chat(cfg, "hi", {})
+    mock_local.assert_called()
+    # System prompt is a list (OAuth path) or string (API key path); we used
+    # API-key here so it's a string. Either way it must mention the fake date.
+    sent_system = fake_client.messages.create.call_args.kwargs["system"]
+    if isinstance(sent_system, list):
+        sent_system = " ".join(b.get("text", "") for b in sent_system)
+    assert "2026-05-05" in sent_system
+
+
 # ── chat() with image input ─────────────────────────────────────────────────
 
 

@@ -90,8 +90,17 @@ def meal_from_barcode_info(
     Used by both the CLI `log-barcode` subcommand and the Telegram bot's
     barcode flow so the scaling math stays identical.
     """
+    # Coerce to float defensively — the chat dispatcher's lookup_barcode tool
+    # passes whatever the model produced, which can be a string ("100"), an
+    # int, or a float. Without this, `factor = grams / 100.0` would crash on
+    # str input and a barcode tool call with a stringly-typed `grams` would
+    # fail mid-loop.
     if grams is None:
         grams = info.get("serving_size_g") or 100.0
+    try:
+        grams = float(grams)
+    except (TypeError, ValueError):
+        grams = float(info.get("serving_size_g") or 100.0)
     factor = grams / 100.0
 
     def _scale(per100: float | None) -> float | None:

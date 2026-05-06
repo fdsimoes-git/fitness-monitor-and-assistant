@@ -45,6 +45,34 @@ def tmpdb():
         yield p
 
 
+def test_meal_from_barcode_info_coerces_string_grams():
+    """`meal_from_barcode_info` is reached via the chat lookup_barcode tool
+    where the model may pass grams as a string. The helper must coerce
+    rather than crash on `factor = grams / 100.0`."""
+    from src import food
+    info = {
+        "name": "Test Bar", "kcal_100g": 400, "protein_100g": 5, "carbs_100g": 60,
+        "fat_100g": 14, "fiber_100g": 3, "sugars_100g": 35, "saturated_fat_100g": 8,
+        "sodium_mg_100g": 80, "food_category": "Sugary snacks", "serving_size_g": 50,
+    }
+    out = food.meal_from_barcode_info(info, "1234567890123", grams="30")
+    assert out["kcal"] == 120  # 400 * 0.3
+    assert out["description"] == "Test Bar (30g)"
+
+
+def test_meal_from_barcode_info_falls_back_when_grams_unparseable():
+    """A non-numeric grams (e.g. None-of-the-above gibberish) falls back to
+    the API's serving_size_g rather than raising."""
+    from src import food
+    info = {
+        "name": "X", "kcal_100g": 100, "protein_100g": 1, "carbs_100g": 10, "fat_100g": 1,
+        "fiber_100g": None, "sugars_100g": None, "saturated_fat_100g": None,
+        "sodium_mg_100g": None, "food_category": None, "serving_size_g": 50,
+    }
+    out = food.meal_from_barcode_info(info, "1", grams="not-a-number")
+    assert out["kcal"] == 50  # 100 * 0.5 (fell back to 50g serving)
+
+
 def test_protein_target_scales_with_weight(tmpdb):
     assert db.protein_target_g(_make_cfg(tmpdb, user_weight_kg=80)) == pytest.approx(128.0)
     assert db.protein_target_g(_make_cfg(tmpdb, user_weight_kg=60)) == pytest.approx(96.0)
