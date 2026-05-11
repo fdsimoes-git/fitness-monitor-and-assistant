@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import requests
 
 from src import db, telegram_bot
 from src.config import Config
@@ -794,3 +795,80 @@ def test_photo_flow_does_not_leak_image_bytes_to_db(tmpdb):
     with sqlite3.connect(tmpdb) as conn:
         names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
     assert not any(n.startswith("photo") for n in names)
+
+
+# ── _retry_transient tests ────────────────────────────────────────────────
+
+
+def test_retry_transient_retries_on_timeout(monkeypatch):
+    """_retry_transient retries on Timeout and sleeps between attempts."""
+    import time as _time
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[
+        requests.exceptions.Timeout("timeout"),
+        "ok",
+    ])
+    sleep_mock = MagicMock()
+    monkeypatch.setattr(_time, "sleep", sleep_mock)
+    # Also patch time.sleep in the module under test
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", sleep_mock)
+
+    result = _retry_transient(fn, retries=2, backoff=0.5)
+    assert result == "ok"
+    assert fn.call_count == 2
+    sleep_mock.assert_called_once_with(0.5)
+
+
+def test_retry_transient_retries_on_connection_error(monkeypatch):
+    """_retry_transient retries on ConnectionError."""
+    import time as _time
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[
+        requests.exceptions.ConnectionError("conn"),
+        requests.exceptions.ConnectionError("conn"),
+        "ok",
+    ])
+    sleep_mock = MagicMock()
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", sleep_mock)
+
+    result = _retry_transient(fn, retries=2, backoff=1.0)
+    assert result == "ok"
+    assert fn.call_count == 3
+    assert sleep_mock.call_count == 2
+
+
+def test_retry_transient_raises_after_exhaustion(monkeypatch):
+    """_retry_transient raises after all retries are exhausted."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=requests.exceptions.Timeout("timeout"))
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    with pytest.raises(requests.exceptions.Timeout):
+        _retry_transient(fn, retries=1)
+    assert fn.call_count == 2
+
+
+def test_retry_transient_retries_on_http_error(monkeypatch):
+    """_retry_transient retries on HTTPError from raise_for_status()."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[
+        requests.exceptions.HTTPError("500 Server Error"),
+        "ok",
+    ])
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    result = _retry_transient(fn, retries=1)
+    assert result == "ok"
+    assert fn.call_count == 2
