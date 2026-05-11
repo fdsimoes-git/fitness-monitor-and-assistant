@@ -42,6 +42,7 @@ import uuid
 from typing import Any
 
 import requests
+import requests.exceptions
 
 from . import alerts, db, food, llm
 from .config import Config
@@ -604,16 +605,29 @@ def _send_status(cfg: Config, text: str) -> int | None:
         return None
 
 
+def _retry_transient(fn, *, retries: int = 2, backoff: float = 1.0):
+    """Call *fn*; retry up to *retries* times on transient network errors."""
+    for attempt in range(1 + retries):
+        try:
+            return fn()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt < retries:
+                log.warning("Transient Telegram error (attempt %d/%d): %s", attempt + 1, retries + 1, e)
+                time.sleep(backoff)
+            else:
+                raise
+
+
 def _edit_status(cfg: Config, msg_id: int, text: str) -> None:
     api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
     try:
-        requests.post(
+        _retry_transient(lambda: requests.post(
             f"{api}/editMessageText",
             json={"chat_id": cfg.telegram_chat_id, "message_id": msg_id, "text": text},
             timeout=5,
-        )
+        ))
     except Exception as e:  # noqa: BLE001
-        log.debug("edit_status failed (non-fatal): %s", e)
+        log.warning("edit_status failed (non-fatal): %s", e)
 
 
 def _delete_message(cfg: Config, msg_id: int) -> None:
@@ -680,11 +694,11 @@ def _answer_callback(cfg: Config, callback_id: str | None, text: str) -> None:
         return
     api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
     try:
-        requests.post(
+        _retry_transient(lambda: requests.post(
             f"{api}/answerCallbackQuery",
             json={"callback_query_id": callback_id, "text": text},
             timeout=10,
-        )
+        ))
     except Exception as e:  # noqa: BLE001
         log.error("answerCallbackQuery failed: %s", e)
 
@@ -702,7 +716,7 @@ def _edit_message_remove_keyboard(
     """
     api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
     try:
-        requests.post(
+        _retry_transient(lambda: requests.post(
             f"{api}/editMessageText",
             json={
                 "chat_id": chat_id,
@@ -711,7 +725,7 @@ def _edit_message_remove_keyboard(
                 "reply_markup": {"inline_keyboard": []},
             },
             timeout=10,
-        )
+        ))
     except Exception as e:  # noqa: BLE001
         log.error("editMessageText failed: %s", e)
 
