@@ -802,7 +802,6 @@ def test_photo_flow_does_not_leak_image_bytes_to_db(tmpdb):
 
 def test_retry_transient_retries_on_timeout(monkeypatch):
     """_retry_transient retries on Timeout and sleeps between attempts."""
-    import time as _time
     from unittest.mock import MagicMock
     from src.telegram_bot import _retry_transient
 
@@ -811,8 +810,8 @@ def test_retry_transient_retries_on_timeout(monkeypatch):
         "ok",
     ])
     sleep_mock = MagicMock()
-    monkeypatch.setattr(_time, "sleep", sleep_mock)
-    # Also patch time.sleep in the module under test
+    # _retry_transient uses src.telegram_bot.time.sleep — that's the only
+    # binding worth patching.
     import src.telegram_bot as _tb
     monkeypatch.setattr(_tb.time, "sleep", sleep_mock)
 
