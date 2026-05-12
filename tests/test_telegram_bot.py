@@ -940,3 +940,27 @@ def test_check_telegram_ok_passes_on_ok_true():
     r._content = b'{"ok": true, "result": {}}'
     # No exception.
     _check_telegram_ok(r)
+
+
+def test_check_telegram_ok_raises_when_ok_field_missing():
+    """A 200 JSON object without an `ok` field is just as broken as ok:false —
+    treat any body that isn't explicitly ok:true as an application error."""
+    from src.telegram_bot import _check_telegram_ok, _TelegramAPIError
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'{"result": {}}'
+    with pytest.raises(_TelegramAPIError, match="ok!=true"):
+        _check_telegram_ok(r)
+
+
+def test_check_telegram_ok_raises_on_non_dict_json():
+    """Telegram's contract is a JSON object; a list/scalar 200 body indicates
+    something is very wrong upstream and must not be treated as success."""
+    from src.telegram_bot import _check_telegram_ok, _TelegramAPIError
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'[1, 2, 3]'
+    with pytest.raises(_TelegramAPIError, match="non-object JSON body"):
+        _check_telegram_ok(r)

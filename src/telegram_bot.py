@@ -597,7 +597,7 @@ def _send_status(cfg: Config, text: str) -> int | None:
             json={"chat_id": cfg.telegram_chat_id, "text": text},
             timeout=10,
         )
-        r.raise_for_status()
+        _check_telegram_ok(r)
         return ((r.json() or {}).get("result") or {}).get("message_id")
     except Exception as e:  # noqa: BLE001
         log.debug("send_status failed (non-fatal): %s", _redact(str(e)))
@@ -623,22 +623,26 @@ def _redact(msg: str) -> str:
 
 
 def _check_telegram_ok(r: requests.Response) -> None:
-    """Raise on transport errors AND on Telegram ok=false bodies.
+    """Raise on transport errors AND on any non-``ok:true`` Telegram body.
 
     Telegram returns HTTP 200 with ``{ok: false, error_code, description}``
     for application-level failures (e.g. "message to edit not found"), so
-    ``raise_for_status()`` alone leaves those silent. A 200 that isn't valid
-    JSON is equally unexpected — surface it as an error so the caller can
-    log/retry rather than treating it as success.
+    ``raise_for_status()`` alone leaves those silent. We treat anything that
+    isn't a JSON object with ``ok == True`` as an error — a 200 with a
+    missing ``ok`` field, a non-dict JSON value, or invalid JSON are all
+    equally unexpected and should surface so callers can log/retry rather
+    than swallowing them as success.
     """
     r.raise_for_status()
     try:
         body = r.json()
     except ValueError as e:
         raise _TelegramAPIError(f"Telegram returned non-JSON body: {e}") from e
-    if isinstance(body, dict) and body.get("ok") is False:
+    if not isinstance(body, dict):
+        raise _TelegramAPIError(f"Telegram returned non-object JSON body: {body!r}")
+    if body.get("ok") is not True:
         raise _TelegramAPIError(
-            f"Telegram ok=false: {body.get('error_code')} {body.get('description')}"
+            f"Telegram ok!=true: {body.get('error_code')} {body.get('description')}"
         )
 
 
@@ -724,7 +728,7 @@ def _send_plain(cfg: Config, text: str) -> bool:
             json={"chat_id": cfg.telegram_chat_id, "text": text},
             timeout=10,
         )
-        r.raise_for_status()
+        _check_telegram_ok(r)
         return True
     except Exception as e:  # noqa: BLE001
         log.error("send_plain failed: %s", _redact(str(e)))
@@ -743,7 +747,7 @@ def _send_with_keyboard(cfg: Config, text: str, keyboard: list[list[dict]]) -> b
             },
             timeout=10,
         )
-        r.raise_for_status()
+        _check_telegram_ok(r)
         return True
     except Exception as e:  # noqa: BLE001
         log.error("send_with_keyboard failed: %s", _redact(str(e)))
