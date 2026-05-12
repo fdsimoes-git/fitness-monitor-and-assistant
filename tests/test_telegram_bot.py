@@ -824,7 +824,6 @@ def test_retry_transient_retries_on_timeout(monkeypatch):
 
 def test_retry_transient_retries_on_connection_error(monkeypatch):
     """_retry_transient retries on ConnectionError."""
-    import time as _time
     from unittest.mock import MagicMock
     from src.telegram_bot import _retry_transient
 
@@ -857,18 +856,88 @@ def test_retry_transient_raises_after_exhaustion(monkeypatch):
     assert fn.call_count == 2
 
 
-def test_retry_transient_retries_on_http_error(monkeypatch):
-    """_retry_transient retries on HTTPError from raise_for_status()."""
+def _http_error(status: int) -> requests.exceptions.HTTPError:
+    """Build an HTTPError with a response carrying the given status code."""
+    resp = requests.Response()
+    resp.status_code = status
+    return requests.exceptions.HTTPError(f"{status} error", response=resp)
+
+
+def test_retry_transient_retries_on_5xx(monkeypatch):
+    """_retry_transient retries when the HTTPError carries a 5xx status."""
     from unittest.mock import MagicMock
     from src.telegram_bot import _retry_transient
 
-    fn = MagicMock(side_effect=[
-        requests.exceptions.HTTPError("500 Server Error"),
-        "ok",
-    ])
+    fn = MagicMock(side_effect=[_http_error(500), "ok"])
     import src.telegram_bot as _tb
     monkeypatch.setattr(_tb.time, "sleep", MagicMock())
 
     result = _retry_transient(fn, retries=1)
     assert result == "ok"
     assert fn.call_count == 2
+
+
+def test_retry_transient_retries_on_429(monkeypatch):
+    """Rate-limit responses are transient — retry them."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[_http_error(429), "ok"])
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    result = _retry_transient(fn, retries=1)
+    assert result == "ok"
+    assert fn.call_count == 2
+
+
+def test_retry_transient_does_not_retry_4xx(monkeypatch):
+    """4xx client errors (except 429) are permanent — re-raise immediately."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=_http_error(400))
+    import src.telegram_bot as _tb
+    sleep_mock = MagicMock()
+    monkeypatch.setattr(_tb.time, "sleep", sleep_mock)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        _retry_transient(fn, retries=2)
+    # No retries attempted, no sleep.
+    assert fn.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_retry_transient_does_not_retry_404(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=_http_error(404))
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        _retry_transient(fn, retries=2)
+    assert fn.call_count == 1
+
+
+def test_check_telegram_ok_raises_on_ok_false():
+    """Telegram returning HTTP 200 with ok:false must raise so the failure
+    surfaces — raise_for_status alone doesn't catch this case."""
+    from src.telegram_bot import _check_telegram_ok, _TelegramAPIError
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'{"ok": false, "error_code": 400, "description": "message to edit not found"}'
+    with pytest.raises(_TelegramAPIError, match="message to edit not found"):
+        _check_telegram_ok(r)
+
+
+def test_check_telegram_ok_passes_on_ok_true():
+    from src.telegram_bot import _check_telegram_ok
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'{"ok": true, "result": {}}'
+    # No exception.
+    _check_telegram_ok(r)

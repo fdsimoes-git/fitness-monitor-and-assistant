@@ -604,14 +604,49 @@ def _send_status(cfg: Config, text: str) -> int | None:
         return None
 
 
+class _TelegramAPIError(Exception):
+    """Telegram returned HTTP 200 with ok:false (application-level error)."""
+
+
+def _check_telegram_ok(r: requests.Response) -> None:
+    """Raise on transport errors AND on Telegram ok=false bodies.
+
+    Telegram returns HTTP 200 with ``{ok: false, error_code, description}``
+    for application-level failures (e.g. "message to edit not found"), so
+    ``raise_for_status()`` alone leaves those silent.
+    """
+    r.raise_for_status()
+    try:
+        body = r.json()
+    except ValueError:
+        return
+    if isinstance(body, dict) and body.get("ok") is False:
+        raise _TelegramAPIError(
+            f"Telegram ok=false: {body.get('error_code')} {body.get('description')}"
+        )
+
+
 def _retry_transient(fn, *, retries: int = 2, backoff: float = 1.0):
-    """Call *fn*; retry up to *retries* times on transient network errors."""
+    """Call *fn*; retry up to *retries* times on transient network errors.
+
+    HTTPError is only retried for 5xx and 429; other 4xx responses are
+    permanent client errors and are re-raised immediately.
+    """
     for attempt in range(1 + retries):
         try:
             return fn()
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.HTTPError) as e:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             if attempt < retries:
                 log.warning("Transient Telegram error (attempt %d/%d): %s", attempt + 1, retries + 1, e)
+                time.sleep(backoff)
+            else:
+                raise
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status is None or (status < 500 and status != 429):
+                raise
+            if attempt < retries:
+                log.warning("Transient Telegram HTTP %s (attempt %d/%d): %s", status, attempt + 1, retries + 1, e)
                 time.sleep(backoff)
             else:
                 raise
@@ -626,8 +661,10 @@ def _edit_status(cfg: Config, msg_id: int, text: str) -> None:
                 json={"chat_id": cfg.telegram_chat_id, "message_id": msg_id, "text": text},
                 timeout=5,
             )
-            r.raise_for_status()
-        _retry_transient(_do)
+            _check_telegram_ok(r)
+        # Tight bounds: this runs on the dispatch hot path, so cap total
+        # latency well below the 30s long-poll cadence.
+        _retry_transient(_do, retries=1, backoff=0.5)
     except Exception as e:  # noqa: BLE001
         log.warning("edit_status failed (non-fatal): %s", e)
 
@@ -702,7 +739,7 @@ def _answer_callback(cfg: Config, callback_id: str | None, text: str) -> None:
                 json={"callback_query_id": callback_id, "text": text},
                 timeout=10,
             )
-            r.raise_for_status()
+            _check_telegram_ok(r)
         _retry_transient(_do, retries=1)
     except Exception as e:  # noqa: BLE001
         log.error("answerCallbackQuery failed: %s", e)
@@ -732,7 +769,7 @@ def _edit_message_remove_keyboard(
                 },
                 timeout=10,
             )
-            r.raise_for_status()
+            _check_telegram_ok(r)
         _retry_transient(_do)
     except Exception as e:  # noqa: BLE001
         log.error("editMessageText failed: %s", e)
