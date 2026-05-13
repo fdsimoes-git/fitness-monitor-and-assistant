@@ -964,3 +964,99 @@ def test_check_telegram_ok_raises_on_non_dict_json():
     r._content = b'[1, 2, 3]'
     with pytest.raises(_TelegramAPIError, match="non-object JSON body"):
         _check_telegram_ok(r)
+
+
+# ── _redact token sanitization ────────────────────────────────────────────
+
+
+def test_redact_strips_bot_token_from_telegram_url():
+    """A full Telegram API URL containing the bot token must be rewritten so
+    the token is replaced with '<redacted>' — otherwise HTTPError stringifies
+    leak credentials into log files."""
+    from src.telegram_bot import _redact
+
+    msg = (
+        "500 Server Error: Internal Server Error for url: "
+        "https://api.telegram.org/bot123456:ABC-DEF_secret/sendMessage"
+    )
+    out = _redact(msg)
+    assert "123456:ABC-DEF_secret" not in out
+    assert "https://api.telegram.org/bot<redacted>/sendMessage" in out
+
+
+def test_redact_strips_token_from_file_download_url():
+    """The /file/bot<TOKEN>/<path> variant (used by getFile downloads) must
+    also be redacted — the regex covers both URL shapes."""
+    from src.telegram_bot import _redact
+
+    msg = "for url: https://api.telegram.org/file/bot987654:XYZ-TOKEN/photos/file_0.jpg"
+    out = _redact(msg)
+    assert "987654:XYZ-TOKEN" not in out
+    assert "https://api.telegram.org/file/bot<redacted>/photos/file_0.jpg" in out
+
+
+def test_redact_redacts_http_scheme_too():
+    """The pattern is scheme-agnostic (http or https) — both must be sanitized."""
+    from src.telegram_bot import _redact
+
+    msg = "for url: http://api.telegram.org/bot111:AAA/getMe"
+    out = _redact(msg)
+    assert "111:AAA" not in out
+    assert "http://api.telegram.org/bot<redacted>/getMe" in out
+
+
+def test_redact_leaves_non_telegram_strings_unchanged():
+    """Strings without the Telegram bot-token URL shape pass through verbatim."""
+    from src.telegram_bot import _redact
+
+    for msg in [
+        "connection timed out",
+        "HTTPError: 500 Server Error",
+        "https://example.com/bot/secret",  # not api.telegram.org
+        "bot123:ABC",  # not embedded in a URL
+        "ConnectionError: name resolution failed",
+    ]:
+        assert _redact(msg) == msg
+
+
+def test_redact_handles_empty_string():
+    from src.telegram_bot import _redact
+
+    assert _redact("") == ""
+
+
+def test_redact_handles_multiple_token_urls_in_one_message():
+    """Some exceptions chain multiple URLs (e.g. retry trace); every occurrence
+    must be redacted, not just the first."""
+    from src.telegram_bot import _redact
+
+    msg = (
+        "first https://api.telegram.org/bot111:AAA/sendMessage failed, "
+        "retry https://api.telegram.org/bot111:AAA/sendMessage also failed"
+    )
+    out = _redact(msg)
+    assert "111:AAA" not in out
+    assert out.count("bot<redacted>") == 2
+
+
+def test_redact_preserves_path_after_token():
+    """The redaction must stop at the token boundary — the method name and
+    trailing path after the token are preserved so logs remain useful."""
+    from src.telegram_bot import _redact
+
+    msg = "for url: https://api.telegram.org/bot999:SECRET/editMessageText?chat_id=42"
+    out = _redact(msg)
+    assert "999:SECRET" not in out
+    assert "/editMessageText?chat_id=42" in out
+
+
+def test_redact_handles_token_url_in_quoted_context():
+    """The regex stops at quote characters so a URL embedded in a quoted
+    error message (e.g. JSON error payload) still gets its token redacted
+    without swallowing the closing quote."""
+    from src.telegram_bot import _redact
+
+    msg = 'error: "https://api.telegram.org/bot42:TOK/sendMessage"'
+    out = _redact(msg)
+    assert "42:TOK" not in out
+    assert 'bot<redacted>/sendMessage"' in out
