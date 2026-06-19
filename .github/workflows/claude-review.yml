@@ -47,7 +47,7 @@ jobs:
           # SDK hides everything and silent failures are invisible.
           show_full_output: true
           prompt: |
-            Review PR #${{ github.event.pull_request.number }} of
+            Review PR #${{ github.event.pull_request.number || github.event.issue.number }} of
             ${{ github.repository }}. Read CLAUDE.md and
             .github/CODE_REVIEW.md if present and follow their
             standards. Focus on: correctness bugs, security issues,
@@ -61,7 +61,7 @@ jobs:
               cat <<'REVIEW_EOF' > /tmp/review.md
               <YOUR MARKDOWN REVIEW HERE>
               REVIEW_EOF
-              gh pr comment ${{ github.event.pull_request.number }} \
+              gh pr comment ${{ github.event.pull_request.number || github.event.issue.number }} \
                 --body-file /tmp/review.md
 
             Format the review body as either:
