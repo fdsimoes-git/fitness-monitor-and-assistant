@@ -76,6 +76,6 @@ jobs:
             issues — silence is not acceptable; the PR author needs
             to see that the review ran.
           claude_args: |
-            --model claude-opus-4-7
+            --model claude-opus-4-8
             --max-turns 30
             --allowedTools Read,Grep,Glob,Bash
