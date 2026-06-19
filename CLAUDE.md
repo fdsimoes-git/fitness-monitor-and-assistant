@@ -23,10 +23,12 @@ bash scripts/setup.sh
 .venv/bin/python -m src.cli prune --days 90
 .venv/bin/python -m src.cli activities --days 14
 .venv/bin/python -m src.cli log-meal --desc 'oats' --kcal 350
+.venv/bin/python -m src.cli log-meal-ai --desc 'two eggs and toast'        # Claude extracts macros, then logs (needs requirements-bot.txt)
 .venv/bin/python -m src.cli log-barcode 5449000000996 --grams 330
 .venv/bin/python -m src.cli meals [--date YYYY-MM-DD]
 .venv/bin/python -m src.cli calorie-balance [--date YYYY-MM-DD]
 .venv/bin/python -m src.cli test-alert
+.venv/bin/python -m src.cli bot                                   # run the Telegram assistant in the foreground (needs requirements-bot.txt)
 
 # Tests (pytest)
 .venv/bin/pytest
@@ -49,7 +51,7 @@ The `dashboard` command needs the optional FastAPI/uvicorn deps:
 
 ### Cooldowns are persisted, per-alert-kind
 
-`alerts.maybe_alert(kind=…)` reads `last_alert_ts(kind)` from the `alerts` table and suppresses if elapsed < cooldown. Cooldowns survive restarts. Default is `ALERT_COOLDOWN_SECONDS` from env, but daily-readiness checks (`illness_risk`, `training_ready`, `recovery_day`) override it to ~22h via the `cooldown_seconds=` kwarg so they fire at most once per day.
+`alerts.maybe_alert(kind=…)` reads `last_alert_ts(kind)` from the `alerts` table and suppresses if elapsed < cooldown. Cooldowns survive restarts. Default is `ALERT_COOLDOWN_SECONDS` from env, but daily-readiness checks (`illness_risk`, `training_ready`, `recovery_day`) override it to ~22h via the `cooldown_seconds=ONCE_PER_DAY_SECONDS` kwarg (`ONCE_PER_DAY_SECONDS = 22 * 3600` in `src/smart_alerts.py`) so they fire at most once per day — retune all three from that one constant.
 
 ### Smart-alert thresholds are evidence-based — don't tweak casually
 
@@ -67,6 +69,8 @@ Each check has a minimum-samples floor (`*_MIN_BASELINE_SAMPLES`) so a fresh DB 
 
 `get_activities(0, 10)` is called once per poll and rows are deduped via `upsert_activity` keyed on `activity_id`.
 
+The pure `normalize_*` helpers (`normalize_stats` / `_sleep` / `_stress` / `_hrv`) are unit-tested in `tests/test_poller_normalizers.py`, including the `hrvLastNightAvg`/top-level fallback paths and `None`/missing-payload handling.
+
 ### Time convention: UTC for storage, Pi-local for day-bucketing
 
 Two clocks coexist deliberately:
@@ -74,17 +78,25 @@ Two clocks coexist deliberately:
 - **Storage timestamps** (`*.ts`, `meals.meal_time`, `daily_summary.fetched_at`, `alerts.ts`, etc.) are written as ISO-8601 UTC strings — they record the absolute moment something happened and must never lie about that.
 - **Day-bucketing** (`daily_summary.date`, `activities.date`, the chat assistant's "today", any `WHERE date = …` query) follows the **Pi's local timezone**. Most date columns are stored as local YYYY-MM-DD strings (e.g. `daily_summary.date` is `date.today().isoformat()` from the poller; `activities.date` is `Garmin.startTimeLocal[:10]`).
 
-The mismatch breaks near midnight UTC: ask `/today` at 22:30 local UTC-3 (= 01:30 UTC next day), and a UTC-anchored query returns "tomorrow"'s row while the user means today. Use `db.local_today()` for any "what local day is it?" calculation; reserve `datetime.now(timezone.utc)` for full timestamps. The bot, the chat system prompt, the chat tool dispatcher, and four `db.py` helpers (`recent_activities`, `prune_old_data`'s activities cutoff, `recent_calorie_balance`, `daily_readiness_history`) all route through this single seam — `tests/test_nutrition.py::test_recent_calorie_balance_anchors_on_local_today` (and friends) regression-test the convention.
+The mismatch breaks near midnight UTC: ask `/today` at 22:30 local UTC-3 (= 01:30 UTC next day), and a UTC-anchored query returns "tomorrow"'s row while the user means today. Use `db.local_today()` for any "what local day is it?" calculation; reserve `datetime.now(timezone.utc)` for full timestamps. The bot, the chat system prompt, the chat tool dispatcher, and four `db.py` helpers (`recent_activities`, `prune_old_data`'s activities cutoff, `recent_calorie_balance`, `daily_readiness_history`) all route through this single seam — `tests/test_nutrition.py::test_recent_calorie_balance_anchors_onlocal_today` (and friends — note the merged-underscore spelling in those test names) regression-test the convention.
+
+One column bucks the "store a local `YYYY-MM-DD`" rule: `meals.meal_time` is a full UTC timestamp, so meal day-bucketing is special. `meals_for_date()` converts the requested local date into a UTC `[local-midnight, +1 day)` window (via `.astimezone()`) and queries that range — *not* a `WHERE date = local_string` comparison. `prune_old_data()` likewise uses a UTC `cutoff_ts` for meals but a Pi-local `cutoff_date` for activities.
 
 ### Schema lives in `src/db.py:SCHEMA`; migrations are minimal
 
-`init_db()` runs the full `CREATE TABLE IF NOT EXISTS` script, then `_migrate()` for any post-hoc column adds (currently `alerts.message`). When adding columns, append to `_migrate()` with a column-existence check — don't rewrite SCHEMA assuming the user re-creates the DB.
+`init_db()` runs the full `CREATE TABLE IF NOT EXISTS` script, then `_migrate()` for any post-hoc column adds (currently `alerts.message`, plus five nutrition columns back-filled onto `meals`: `fiber_g`, `sugars_g`, `saturated_fat_g`, `sodium_mg`, `food_category`). When adding columns, append to `_migrate()` with a column-existence check — don't rewrite SCHEMA assuming the user re-creates the DB.
 
 Retention: `daily_summary` and `alerts` are kept forever (one row per day, tiny). `activities` and `meals` are pruned by `prune_old_data()` after `--days` (default 90). The prune timer runs Sundays 03:00.
 
 ### Calorie balance combines four sources
 
-`db.calorie_balance_for_date()` sums: meal `kcal` (eaten) vs activity `calories` + BMR (Mifflin-St Jeor from `cfg.user_*`) + step calories (~0.048 kcal/step scaled to weight). Requires the biometric env vars; without them BMR/steps fall to 0 and only activities count.
+`db.calorie_balance_for_date()` sums: meal `kcal` (eaten) vs activity `calories` + BMR (Mifflin-St Jeor from `cfg.user_*`; the *male* formula when `cfg.user_sex.lower() == 'male'`, female otherwise) + step calories (~0.048 kcal/step scaled to weight). Requires the biometric env vars; without them BMR/steps fall to 0 and only activities count.
+
+It returns a dict the digest, dashboard, and chat tools all consume: `eaten_kcal`, `burned_kcal` (**activity-only**), `bmr_kcal`, `steps_burned_kcal`, `total_burned_kcal` (= activity + BMR + steps), `balance_kcal` (= eaten − total_burned), the macro fields, and `meal_count`. `db.energy_availability()` reuses this dict and reads the *activity-only* `burned_kcal` for its RED-S math — don't confuse it with `total_burned_kcal`.
+
+### Daily digest is a three-source render
+
+`digest.build_digest(date)` is more than the `daily_summary` row: it combines `daily_summary` + `activities_for_date` + a full `calorie_balance_for_date`, so the 08:00 Telegram message carries the day's activity list and a Nutrition Summary (intake, BMR/steps/activity breakdown, surplus/deficit, macros) whenever meals were logged.
 
 ### Config is a frozen dataclass loaded once
 
@@ -94,9 +106,19 @@ Retention: `daily_summary` and `alerts` are kept forever (one row per day, tiny)
 
 `src/dashboard.py:create_app` exposes both:
 - `/partials/all` — server-rendered HTML for HTMX swap-in (used for SSR-on-load)
-- `/api/*` — JSON endpoints (`summary`, `trends`, `activities`, `alerts`, `readiness`, `meals`, `calorie-balance`) consumed by Chart.js
+- `/api/*` — JSON endpoints. Legacy/Chart.js set: `summary`, `trends`, `activities`, `alerts`, `readiness`, `meals`, `calorie-balance`. Plus four novel-metric endpoints feeding the redesigned UI: `readiness-v2` (composite readiness), `training-intel` (ACWR + monotony + Z2 + sleep debt), `heatmap` (annual readiness, default 365 days), `nutrition-v2` (balance + meals + macro/fiber/sodium targets + energy availability + whole-food % + meal timing + 7-day history).
 
 All frontend assets (Tailwind, Chart.js, htmx) come from CDN — no build step.
+
+**`src/dashboard.py` renders; `src/db.py` computes.** Every derived metric named in "What this is" (composite readiness, ACWR, training monotony, Z2 minutes, sleep debt) plus the nutrition targets and `energy_availability` / `whole_food_pct` / `meal_timing_summary` live as functions in `db.py` — `render_full` and the chat tools just call them. **`db.py` is the single source of metric math**; change a formula there and it propagates to the dashboard, the JSON API, and the bot at once.
+
+### Training Intelligence: one bundle, two surfaces
+
+The ACWR / training-monotony / Z2-minutes / 7-day sleep-debt quartet (`db.acwr`, `db.training_monotony`, `db.z2_minutes_for_week`, `db.sleep_debt`) is assembled into the identical `{acwr, monotony, z2, sleep_debt}` dict in two places: the dashboard's "Training Intelligence" section (`dashboard._training_intel_html`, fed by `render_full`) and the chat tool `get_training_intel` (`llm._execute_chat_tool`). The `/api/training-intel` endpoint returns the same shape. Change a band threshold or the HRmax/Z2 math in `db.py` and all three move together. `tests/test_training_intel.py` pins the ACWR optimal/high-risk bands, the uniform-load monotony flag, Z2 zone counting (incl. explicit-HRmax override), and sleep-debt accumulation.
+
+### Dashboard metric info-panels live in `src/metric_info.py`
+
+`metric_info.INFO` is a registry keyed by `metric_id` — the `data-info="…"` attribute on each dashboard card. Each entry has `title`, `what_html` (static explainer markup), `sources` (a list of `{title, url}` citations), and `build_insight(ctx)` — a callable that renders a data-driven recommendation from the per-render context. `render_full` assembles an `info_ctx` (cfg, summary, readiness, the training-intel metrics, balance, meals, targets, history, activities) and calls `metric_info.build_payload(ctx)`, serializing the result into a single `<script id="metric-info-data">` block the slide-in panel JS reads on click. **Add a card to `dashboard.py` and you must give it a `data-info` id with a matching `INFO` entry**, or the panel shows "Info coming soon"; a thrown `build_insight` is swallowed and shows "Insight unavailable". `tests/test_metric_info.py` enforces the entry shape and that `build_payload` covers every registered metric.
 
 ### Telegram fitness/nutrition assistant
 
@@ -121,6 +143,8 @@ The 12 tools registered in `llm.CHAT_TOOLS`:
 | `get_training_intel` | | |
 
 `lookup_barcode` is read-only — it queries Open Food Facts and returns scaled nutrition. The model typically chains it into a `log_meal` proposal afterward; that's the only path that touches the DB.
+
+> The table above is authoritative. The comment above `CHAT_TOOLS` in `src/llm.py` says "four validate-and-stash write tools" — that's stale: there are **3** writes (`log_meal`, `edit_meal`, `delete_meal`); the 4th tool grouped near them, `lookup_barcode`, is read-only.
 
 #### Validate-and-stash two-phase write pattern
 
@@ -147,7 +171,7 @@ Pending entries TTL-out after 1h via `_sweep_pending`. If the bot restarts mid-c
 3. Passes that closure into `chat()` as `progress_cb`. Failures inside the callback are caught in `chat()` and logged — a broken UI hook never breaks the loop.
 4. After `chat()` returns, edits the **same** status message into the final answer (single round-trip) instead of sending a new message. If only proposals were created (model went silent + Confirm/Cancel keyboards visible), deletes the status message.
 
-Tests stub all four bot HTTP helpers (`_send_typing`, `_send_status`, `_edit_status`, `_delete_message`, plus `_answer_callback` and `_edit_message_remove_keyboard`) via an autouse fixture so the suite never touches `api.telegram.org`.
+An autouse fixture (`_no_real_telegram_http`) stubs five bot HTTP helpers (`_send_typing`, `_send_status`, `_edit_status`, `_delete_message`, `_answer_callback`) plus a catch-all `requests.post`, so the suite never touches `api.telegram.org`. `_edit_message_remove_keyboard` is deliberately left un-stubbed by the fixture — callback-path tests patch it individually, and `test_edit_message_remove_keyboard_clears_inline_keyboard` exercises the real implementation against the mocked `requests.post`.
 
 #### Conversational history
 
@@ -195,6 +219,7 @@ Paths are hard-coded to `/home/pi/garmin-monitor`; edit `WorkingDirectory`, `Env
 - **First Garmin login may need MFA.** The poller prompts on stdin via `_prompt_mfa()`, which only works in an interactive TTY. For headless setup, run `python auth_setup.py` once interactively to cache tokens.
 - **TLS fingerprinting:** `python-garminconnect` uses `curl_cffi` to mimic a real browser. If logins start failing, `pip install --upgrade garminconnect curl_cffi` first.
 - **Daily-readiness checks need ~7 days of `daily_summary` history** before they fire — see `*_MIN_BASELINE_SAMPLES`.
+- **Illness alert needs a *contiguous* decline.** `check_illness_risk` walks back from the latest day and bails the instant any day in the `ILLNESS_CONSECUTIVE_DAYS` (2) window has a missing/`None` RHR or HRV, or fails the RHR-up-**and**-HRV-down test. On older accounts where HRV is intermittently missing, the alert can stay silent through a genuine decline — the same HRV-may-be-absent reality the poller papers over with its `hrvLastNightAvg` fallback.
 - **DB cleanup after upgrading from a BLE-era install.** This refactor dropped the `hr_realtime` and `hrv` tables. `init-db` won't drop them on existing DBs (`CREATE TABLE IF NOT EXISTS`); the operator can run `sqlite3 garmin.db 'DROP TABLE IF EXISTS hr_realtime; DROP TABLE IF EXISTS hrv; VACUUM;'` once if they want the disk reclaimed.
 - **Bot needs `requirements-bot.txt` installed.** The base install is intentionally Anthropic-free; `build_anthropic_client` raises a clear `RuntimeError` ("anthropic SDK is not installed. … pip install -r requirements-bot.txt") if the SDK isn't on the path. `tests/test_llm.py` uses `pytest.importorskip("anthropic")` so the test suite still runs cleanly on a base install — bot tests are skipped, the rest pass.
 - **Misleading "credit balance" error** — see the Conventions entry. Rule of thumb: Haiku 4.5 succeeds without the prefix and was historically how this bug got missed; if Haiku works but Sonnet/Opus fails on the same OAuth token, suspect a missing system prefix.

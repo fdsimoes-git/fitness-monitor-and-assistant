@@ -4,7 +4,7 @@ set -euo pipefail
 
 echo "==> Installing system packages"
 sudo apt-get update
-sudo apt-get install -y python3-venv python3-pip bluetooth bluez
+sudo apt-get install -y python3-venv python3-pip
 
 echo "==> Creating venv"
 python3 -m venv .venv
@@ -22,4 +22,5 @@ echo "  1. cp .env.example .env  &&  edit .env"
 echo "  2. .venv/bin/python -m src.cli init-db"
 echo "  3. .venv/bin/python -m src.cli test-alert    # check Telegram"
 echo "  4. .venv/bin/python -m src.cli poll          # check Garmin"
-echo "  5. .venv/bin/python -m src.cli ble           # check watch broadcast"
+echo "  5. .venv/bin/pip install -r requirements-web.txt && .venv/bin/python -m src.cli dashboard   # optional web dashboard"
+echo "  6. .venv/bin/pip install -r requirements-bot.txt && .venv/bin/python -m src.cli bot         # optional Telegram assistant"
