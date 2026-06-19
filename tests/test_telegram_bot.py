@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import requests
 
 from src import db, telegram_bot
 from src.config import Config
@@ -794,3 +795,268 @@ def test_photo_flow_does_not_leak_image_bytes_to_db(tmpdb):
     with sqlite3.connect(tmpdb) as conn:
         names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
     assert not any(n.startswith("photo") for n in names)
+
+
+# ── _retry_transient tests ────────────────────────────────────────────────
+
+
+def test_retry_transient_retries_on_timeout(monkeypatch):
+    """_retry_transient retries on Timeout and sleeps between attempts."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[
+        requests.exceptions.Timeout("timeout"),
+        "ok",
+    ])
+    sleep_mock = MagicMock()
+    # _retry_transient uses src.telegram_bot.time.sleep — that's the only
+    # binding worth patching.
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", sleep_mock)
+
+    result = _retry_transient(fn, retries=2, backoff=0.5)
+    assert result == "ok"
+    assert fn.call_count == 2
+    sleep_mock.assert_called_once_with(0.5)
+
+
+def test_retry_transient_retries_on_connection_error(monkeypatch):
+    """_retry_transient retries on ConnectionError."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[
+        requests.exceptions.ConnectionError("conn"),
+        requests.exceptions.ConnectionError("conn"),
+        "ok",
+    ])
+    sleep_mock = MagicMock()
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", sleep_mock)
+
+    result = _retry_transient(fn, retries=2, backoff=1.0)
+    assert result == "ok"
+    assert fn.call_count == 3
+    assert sleep_mock.call_count == 2
+
+
+def test_retry_transient_raises_after_exhaustion(monkeypatch):
+    """_retry_transient raises after all retries are exhausted."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=requests.exceptions.Timeout("timeout"))
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    with pytest.raises(requests.exceptions.Timeout):
+        _retry_transient(fn, retries=1)
+    assert fn.call_count == 2
+
+
+def _http_error(status: int) -> requests.exceptions.HTTPError:
+    """Build an HTTPError with a response carrying the given status code."""
+    resp = requests.Response()
+    resp.status_code = status
+    return requests.exceptions.HTTPError(f"{status} error", response=resp)
+
+
+def test_retry_transient_retries_on_5xx(monkeypatch):
+    """_retry_transient retries when the HTTPError carries a 5xx status."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[_http_error(500), "ok"])
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    result = _retry_transient(fn, retries=1)
+    assert result == "ok"
+    assert fn.call_count == 2
+
+
+def test_retry_transient_retries_on_429(monkeypatch):
+    """Rate-limit responses are transient — retry them."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=[_http_error(429), "ok"])
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    result = _retry_transient(fn, retries=1)
+    assert result == "ok"
+    assert fn.call_count == 2
+
+
+def test_retry_transient_does_not_retry_4xx(monkeypatch):
+    """4xx client errors (except 429) are permanent — re-raise immediately."""
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=_http_error(400))
+    import src.telegram_bot as _tb
+    sleep_mock = MagicMock()
+    monkeypatch.setattr(_tb.time, "sleep", sleep_mock)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        _retry_transient(fn, retries=2)
+    # No retries attempted, no sleep.
+    assert fn.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_retry_transient_does_not_retry_404(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.telegram_bot import _retry_transient
+
+    fn = MagicMock(side_effect=_http_error(404))
+    import src.telegram_bot as _tb
+    monkeypatch.setattr(_tb.time, "sleep", MagicMock())
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        _retry_transient(fn, retries=2)
+    assert fn.call_count == 1
+
+
+def test_check_telegram_ok_raises_on_ok_false():
+    """Telegram returning HTTP 200 with ok:false must raise so the failure
+    surfaces — raise_for_status alone doesn't catch this case."""
+    from src.telegram_bot import _check_telegram_ok, _TelegramAPIError
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'{"ok": false, "error_code": 400, "description": "message to edit not found"}'
+    with pytest.raises(_TelegramAPIError, match="message to edit not found"):
+        _check_telegram_ok(r)
+
+
+def test_check_telegram_ok_passes_on_ok_true():
+    from src.telegram_bot import _check_telegram_ok
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'{"ok": true, "result": {}}'
+    # No exception.
+    _check_telegram_ok(r)
+
+
+def test_check_telegram_ok_raises_when_ok_field_missing():
+    """A 200 JSON object without an `ok` field is just as broken as ok:false —
+    treat any body that isn't explicitly ok:true as an application error."""
+    from src.telegram_bot import _check_telegram_ok, _TelegramAPIError
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'{"result": {}}'
+    with pytest.raises(_TelegramAPIError, match="ok!=true"):
+        _check_telegram_ok(r)
+
+
+def test_check_telegram_ok_raises_on_non_dict_json():
+    """Telegram's contract is a JSON object; a list/scalar 200 body indicates
+    something is very wrong upstream and must not be treated as success."""
+    from src.telegram_bot import _check_telegram_ok, _TelegramAPIError
+
+    r = requests.Response()
+    r.status_code = 200
+    r._content = b'[1, 2, 3]'
+    with pytest.raises(_TelegramAPIError, match="non-object JSON body"):
+        _check_telegram_ok(r)
+
+
+# ── _redact token sanitization ────────────────────────────────────────────
+
+
+def test_redact_strips_bot_token_from_telegram_url():
+    """A full Telegram API URL containing the bot token must be rewritten so
+    the token is replaced with '<redacted>' — otherwise HTTPError stringifies
+    leak credentials into log files."""
+    from src.telegram_bot import _redact
+
+    msg = (
+        "500 Server Error: Internal Server Error for url: "
+        "https://api.telegram.org/bot123456:ABC-DEF_secret/sendMessage"
+    )
+    out = _redact(msg)
+    assert "123456:ABC-DEF_secret" not in out
+    assert "https://api.telegram.org/bot<redacted>/sendMessage" in out
+
+
+def test_redact_strips_token_from_file_download_url():
+    """The /file/bot<TOKEN>/<path> variant (used by getFile downloads) must
+    also be redacted — the regex covers both URL shapes."""
+    from src.telegram_bot import _redact
+
+    msg = "for url: https://api.telegram.org/file/bot987654:XYZ-TOKEN/photos/file_0.jpg"
+    out = _redact(msg)
+    assert "987654:XYZ-TOKEN" not in out
+    assert "https://api.telegram.org/file/bot<redacted>/photos/file_0.jpg" in out
+
+
+def test_redact_redacts_http_scheme_too():
+    """The pattern is scheme-agnostic (http or https) — both must be sanitized."""
+    from src.telegram_bot import _redact
+
+    msg = "for url: http://api.telegram.org/bot111:AAA/getMe"
+    out = _redact(msg)
+    assert "111:AAA" not in out
+    assert "http://api.telegram.org/bot<redacted>/getMe" in out
+
+
+def test_redact_leaves_non_telegram_strings_unchanged():
+    """Strings without the Telegram bot-token URL shape pass through verbatim."""
+    from src.telegram_bot import _redact
+
+    for msg in [
+        "connection timed out",
+        "HTTPError: 500 Server Error",
+        "https://example.com/bot/secret",  # not api.telegram.org
+        "bot123:ABC",  # not embedded in a URL
+        "ConnectionError: name resolution failed",
+    ]:
+        assert _redact(msg) == msg
+
+
+def test_redact_handles_empty_string():
+    from src.telegram_bot import _redact
+
+    assert _redact("") == ""
+
+
+def test_redact_handles_multiple_token_urls_in_one_message():
+    """Some exceptions chain multiple URLs (e.g. retry trace); every occurrence
+    must be redacted, not just the first."""
+    from src.telegram_bot import _redact
+
+    msg = (
+        "first https://api.telegram.org/bot111:AAA/sendMessage failed, "
+        "retry https://api.telegram.org/bot111:AAA/sendMessage also failed"
+    )
+    out = _redact(msg)
+    assert "111:AAA" not in out
+    assert out.count("bot<redacted>") == 2
+
+
+def test_redact_preserves_path_after_token():
+    """The redaction must stop at the token boundary — the method name and
+    trailing path after the token are preserved so logs remain useful."""
+    from src.telegram_bot import _redact
+
+    msg = "for url: https://api.telegram.org/bot999:SECRET/editMessageText?chat_id=42"
+    out = _redact(msg)
+    assert "999:SECRET" not in out
+    assert "/editMessageText?chat_id=42" in out
+
+
+def test_redact_handles_token_url_in_quoted_context():
+    """The regex stops at quote characters so a URL embedded in a quoted
+    error message (e.g. JSON error payload) still gets its token redacted
+    without swallowing the closing quote."""
+    from src.telegram_bot import _redact
+
+    msg = 'error: "https://api.telegram.org/bot42:TOK/sendMessage"'
+    out = _redact(msg)
+    assert "42:TOK" not in out
+    assert 'bot<redacted>/sendMessage"' in out

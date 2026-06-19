@@ -571,7 +571,7 @@ def _download_telegram_file(cfg: Config, file_id: str) -> tuple[bytes | None, st
         }.get(ext, "image/jpeg")
         return rr.content, mime
     except Exception as e:  # noqa: BLE001
-        log.error("Failed to download file %s: %s", file_id, e)
+        log.error("Failed to download file %s: %s", file_id, _redact(str(e)))
         return None, ""
 
 
@@ -585,7 +585,7 @@ def _send_typing(cfg: Config) -> None:
             timeout=5,
         )
     except Exception as e:  # noqa: BLE001
-        log.debug("sendChatAction failed (non-fatal): %s", e)
+        log.debug("sendChatAction failed (non-fatal): %s", _redact(str(e)))
 
 
 def _send_status(cfg: Config, text: str) -> int | None:
@@ -597,23 +597,102 @@ def _send_status(cfg: Config, text: str) -> int | None:
             json={"chat_id": cfg.telegram_chat_id, "text": text},
             timeout=10,
         )
-        r.raise_for_status()
+        _check_telegram_ok(r)
         return ((r.json() or {}).get("result") or {}).get("message_id")
     except Exception as e:  # noqa: BLE001
-        log.debug("send_status failed (non-fatal): %s", e)
+        log.debug("send_status failed (non-fatal): %s", _redact(str(e)))
         return None
+
+
+class _TelegramAPIError(Exception):
+    """Telegram returned HTTP 200 with ok:false (application-level error)."""
+
+
+_TOKEN_URL_RE = re.compile(r"(https?://api\.telegram\.org/(?:file/)?bot)[^/\s'\"]+")
+
+
+def _redact(msg: str) -> str:
+    """Strip bot tokens from any Telegram URL in a string for safe logging.
+
+    ``requests.exceptions.HTTPError`` stringifies as ``'... for url: <full
+    url>'`` — the full URL includes ``bot<TOKEN>``, which would otherwise
+    leak credentials into log files. Pass any exception string through this
+    before it reaches the logger.
+    """
+    return _TOKEN_URL_RE.sub(r"\1<redacted>", msg)
+
+
+def _check_telegram_ok(r: requests.Response) -> None:
+    """Raise on transport errors AND on any non-``ok:true`` Telegram body.
+
+    Telegram returns HTTP 200 with ``{ok: false, error_code, description}``
+    for application-level failures (e.g. "message to edit not found"), so
+    ``raise_for_status()`` alone leaves those silent. We treat anything that
+    isn't a JSON object with ``ok == True`` as an error — a 200 with a
+    missing ``ok`` field, a non-dict JSON value, or invalid JSON are all
+    equally unexpected and should surface so callers can log/retry rather
+    than swallowing them as success.
+    """
+    r.raise_for_status()
+    try:
+        body = r.json()
+    except ValueError as e:
+        raise _TelegramAPIError(f"Telegram returned non-JSON body: {e}") from e
+    if not isinstance(body, dict):
+        raise _TelegramAPIError(f"Telegram returned non-object JSON body: {body!r}")
+    if body.get("ok") is not True:
+        raise _TelegramAPIError(
+            f"Telegram ok!=true: {body.get('error_code')} {body.get('description')}"
+        )
+
+
+def _retry_transient(fn, *, retries: int = 2, backoff: float = 1.0):
+    """Call *fn*; retry up to *retries* times on transient network errors.
+
+    HTTPError is only retried for 5xx and 429; other 4xx responses are
+    permanent client errors and are re-raised immediately.
+    """
+    for attempt in range(1 + retries):
+        try:
+            return fn()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt < retries:
+                log.warning(
+                    "Transient Telegram error (attempt %d/%d): %s",
+                    attempt + 1, retries + 1, _redact(str(e)),
+                )
+                time.sleep(backoff)
+            else:
+                raise
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status is None or (status < 500 and status != 429):
+                raise
+            if attempt < retries:
+                log.warning(
+                    "Transient Telegram HTTP %s (attempt %d/%d)",
+                    status, attempt + 1, retries + 1,
+                )
+                time.sleep(backoff)
+            else:
+                raise
 
 
 def _edit_status(cfg: Config, msg_id: int, text: str) -> None:
     api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
     try:
-        requests.post(
-            f"{api}/editMessageText",
-            json={"chat_id": cfg.telegram_chat_id, "message_id": msg_id, "text": text},
-            timeout=5,
-        )
+        def _do():
+            r = requests.post(
+                f"{api}/editMessageText",
+                json={"chat_id": cfg.telegram_chat_id, "message_id": msg_id, "text": text},
+                timeout=5,
+            )
+            _check_telegram_ok(r)
+        # Tight bounds: this runs on the dispatch hot path, so cap total
+        # latency well below the 30s long-poll cadence.
+        _retry_transient(_do, retries=1, backoff=0.5)
     except Exception as e:  # noqa: BLE001
-        log.debug("edit_status failed (non-fatal): %s", e)
+        log.warning("edit_status failed (non-fatal): %s", _redact(str(e)))
 
 
 def _delete_message(cfg: Config, msg_id: int) -> None:
@@ -625,7 +704,7 @@ def _delete_message(cfg: Config, msg_id: int) -> None:
             timeout=5,
         )
     except Exception as e:  # noqa: BLE001
-        log.debug("delete_message failed (non-fatal): %s", e)
+        log.debug("delete_message failed (non-fatal): %s", _redact(str(e)))
 
 
 def _format_tool_status(tool_name: str, tool_input: dict) -> str:
@@ -649,10 +728,10 @@ def _send_plain(cfg: Config, text: str) -> bool:
             json={"chat_id": cfg.telegram_chat_id, "text": text},
             timeout=10,
         )
-        r.raise_for_status()
+        _check_telegram_ok(r)
         return True
     except Exception as e:  # noqa: BLE001
-        log.error("send_plain failed: %s", e)
+        log.error("send_plain failed: %s", _redact(str(e)))
         return False
 
 
@@ -668,10 +747,10 @@ def _send_with_keyboard(cfg: Config, text: str, keyboard: list[list[dict]]) -> b
             },
             timeout=10,
         )
-        r.raise_for_status()
+        _check_telegram_ok(r)
         return True
     except Exception as e:  # noqa: BLE001
-        log.error("send_with_keyboard failed: %s", e)
+        log.error("send_with_keyboard failed: %s", _redact(str(e)))
         return False
 
 
@@ -680,13 +759,16 @@ def _answer_callback(cfg: Config, callback_id: str | None, text: str) -> None:
         return
     api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
     try:
-        requests.post(
-            f"{api}/answerCallbackQuery",
-            json={"callback_query_id": callback_id, "text": text},
-            timeout=10,
-        )
+        def _do():
+            r = requests.post(
+                f"{api}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text},
+                timeout=10,
+            )
+            _check_telegram_ok(r)
+        _retry_transient(_do, retries=1)
     except Exception as e:  # noqa: BLE001
-        log.error("answerCallbackQuery failed: %s", e)
+        log.error("answerCallbackQuery failed: %s", _redact(str(e)))
 
 
 def _edit_message_remove_keyboard(
@@ -702,18 +784,24 @@ def _edit_message_remove_keyboard(
     """
     api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
     try:
-        requests.post(
-            f"{api}/editMessageText",
-            json={
-                "chat_id": chat_id,
-                "message_id": msg_id,
-                "text": new_text,
-                "reply_markup": {"inline_keyboard": []},
-            },
-            timeout=10,
-        )
+        def _do():
+            r = requests.post(
+                f"{api}/editMessageText",
+                json={
+                    "chat_id": chat_id,
+                    "message_id": msg_id,
+                    "text": new_text,
+                    "reply_markup": {"inline_keyboard": []},
+                },
+                timeout=5,
+            )
+            _check_telegram_ok(r)
+        # Match _edit_status bounds: this runs in the callback hot path right
+        # after a confirm/cancel tap, so cap total latency well below the 30s
+        # long-poll cadence.
+        _retry_transient(_do, retries=1, backoff=0.5)
     except Exception as e:  # noqa: BLE001
-        log.error("editMessageText failed: %s", e)
+        log.error("editMessageText failed: %s", _redact(str(e)))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
