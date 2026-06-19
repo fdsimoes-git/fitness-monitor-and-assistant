@@ -21,19 +21,46 @@ jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Comment events (issue_comment / pull_request_review_comment) run in the
+    # BASE-repo context with access to secrets and can be raised by anyone who
+    # can comment — including fork-PR authors. Gate those to trusted
+    # author_association values so an untrusted commenter can't trigger a run
+    # that holds the OAuth token. The pull_request trigger is also limited to
+    # same-repo (non-fork) PRs.
     if: |
-      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
-        contains(github.event.comment.body, '@claude')) ||
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
       (github.event_name == 'pull_request_review_comment' &&
-        contains(github.event.comment.body, '@claude'))
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
+      # Skip cleanly (no loud failure) when the OAuth secret isn't configured —
+      # e.g. before the `gh secret set CLAUDE_CODE_OAUTH_TOKEN` step in the PR
+      # body has been run. Tests emptiness only; the value is never printed and
+      # is masked in logs regardless.
+      - name: Verify OAuth token is configured
+        id: secret_check
+        env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$OAUTH" ]; then
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set — skipping the review."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.secret_check.outputs.ok == 'true'
         with:
           fetch-depth: 0
 
       - uses: anthropics/claude-code-action@v1
+        if: steps.secret_check.outputs.ok == 'true'
         env:
           # Auth for the `gh pr comment` call Claude makes via the Bash
           # tool. The action's own posting paths (use_sticky_comment,
