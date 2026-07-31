@@ -1,9 +1,14 @@
 name: Release
 
-# Manually-dispatched release cutter. Creates the tag at the dispatched
-# commit and publishes a GitHub Release whose body comes from the
-# committed notes file .github/release-notes/<tag>.md — so release notes
-# are reviewed in a PR like any other change.
+# Release cutter with two entry points:
+#   1. Manual: Actions → Release → "Run workflow" with tag + title inputs.
+#   2. GitOps: a push to main that changes .github/release-trigger.json —
+#      merge a PR updating that file (plus .github/release-notes/<tag>.md)
+#      and the release cuts itself.
+# Either way the tag is created at the built commit and the release body
+# comes from the committed notes file, so notes are PR-reviewed like any
+# other change. Already-existing releases are skipped, so touching the
+# trigger file for an existing tag is a no-op instead of a red run.
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +18,9 @@ on:
       title:
         description: "Release title"
         required: true
+  push:
+    branches: [main]
+    paths: [".github/release-trigger.json"]
 
 permissions:
   contents: write
@@ -22,12 +30,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve tag and title
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_TITLE: ${{ inputs.title }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            echo "title=$INPUT_TITLE" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(jq -r .tag .github/release-trigger.json)" >> "$GITHUB_OUTPUT"
+            echo "title=$(jq -r .title .github/release-trigger.json)" >> "$GITHUB_OUTPUT"
+          fi
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-          TITLE: ${{ inputs.title }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TITLE: ${{ steps.meta.outputs.title }}
         run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — nothing to do."
+            exit 0
+          fi
           gh release create "$TAG" \
             --target "$GITHUB_SHA" \
             --title "$TITLE" \
