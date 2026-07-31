@@ -886,3 +886,31 @@ def test_chat_full_log_meal_loop_parks_pending(tmpdb_cfg):
     assert pending[pid]["meal"]["description"] == "oats"
     from datetime import date
     assert _db.meals_for_date(tmpdb_cfg.db_path, date.today().isoformat()) == []
+
+
+# ── chat model override (/model) ────────────────────────────────────────────
+
+
+def test_chat_model_override_reaches_messages_create():
+    """The bot's per-session /model pick must win over cfg.claude_model."""
+    cfg = _make_cfg(anthropic_api_key="sk-ant-api03-x", claude_model="claude-sonnet-4-6")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("hi")], stop_reason="end_turn",
+    )
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        llm.chat(cfg, "hello", model="claude-haiku-4-5")
+    assert fake_client.messages.create.call_args.kwargs["model"] == "claude-haiku-4-5"
+
+
+def test_chat_model_defaults_to_cfg_then_constant():
+    """No override → cfg.claude_model; empty cfg model → llm.DEFAULT_MODEL."""
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = SimpleNamespace(
+        content=[_text_block("hi")], stop_reason="end_turn",
+    )
+    with patch("src.llm.build_anthropic_client", return_value=fake_client):
+        llm.chat(_make_cfg(anthropic_api_key="sk-ant-api03-x"), "hello")
+        assert fake_client.messages.create.call_args.kwargs["model"] == "claude-sonnet-4-6"
+        llm.chat(_make_cfg(anthropic_api_key="sk-ant-api03-x", claude_model=""), "hello")
+        assert fake_client.messages.create.call_args.kwargs["model"] == llm.DEFAULT_MODEL

@@ -126,6 +126,7 @@ The ACWR / training-monotony / Z2-minutes / 7-day sleep-debt quartet (`db.acwr`,
 
 - **`/help`, `/start`** → static help text.
 - **`/today`, `/balance`** → `db.calorie_balance_for_date` formatted reply (no Claude call).
+- **`/model`** → inline keyboard to pick the session's Claude model from `CHAT_MODELS` (no Claude call).
 - **Numeric `^\d{8,14}$`** → `food.lookup_barcode` → `food.meal_from_barcode_info` → propose insert (no Claude call).
 - **Anything else (text, photo, photo+caption)** → `llm.chat(cfg, text, pending, image_bytes=…)`.
 
@@ -150,7 +151,7 @@ The 12 tools registered in `llm.CHAT_TOOLS`:
 
 Mirrors `asset-management/server.js:4803-4823`. When Claude calls a write tool, the dispatcher in `llm._execute_chat_tool` does NOT touch the DB. It validates, builds a proposal entry — `{action: 'insert'|'edit'|'delete', meal | meal_id | fields | before, ts}` — and parks it in the per-process `pending` dict via `_stash_pending`. The tool result returned to Claude is `{pending_id, needs_confirmation: True, action, summary}`.
 
-The bot's `_run_chat` snapshots `pending.keys()` before the call and diffs after. For each new pending entry it calls `_surface_pending`, which renders an action-aware Confirm/Cancel inline keyboard (✅ Log it / ✏️ Apply edit / 🗑 Delete). The `callback_data` shape (`confirm:UUID` / `cancel:UUID`) is uniform — `_handle_callback` doesn't need to know about action types; it pops the entry and dispatches to `_apply_pending`, which branches on `entry["action"]`:
+The bot's `_run_chat` snapshots `pending.keys()` before the call and diffs after. For each new pending entry it calls `_surface_pending`, which renders an action-aware Confirm/Cancel inline keyboard (✅ Log it / ✏️ Apply edit / 🗑 Delete). The `callback_data` shape (`confirm:UUID` / `cancel:UUID`) is uniform — `_handle_callback` doesn't need to know about action types; it pops the entry and dispatches to `_apply_pending`, which branches on `entry["action"]`. (A third namespace, `model:<key>` from the `/model` picker, is handled in `_handle_callback` *before* the confirm/cancel validation and never touches `pending`.) The confirm/cancel actions:
 
 - `insert` → `db.insert_meal` (`meal_time` normalized to UTC ISO via `_iso_to_utc_aware`)
 - `edit` → `db.update_meal` (filters fields to `db.EDITABLE_MEAL_COLUMNS`; rejects None/empty for NOT NULL columns; normalizes any supplied `meal_time`)
@@ -184,7 +185,9 @@ Two design choices worth knowing:
 
 History is per-process and lost on restart (matches `pending`'s lifetime). For a single-user Pi bot this is fine; if conversations need to survive restarts, persist to SQLite as a follow-up.
 
-`src/llm.py` mirrors the credential-resolution pattern from `asset-management/server.js` (lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set we use the OAuth route (Bearer token + `anthropic-beta: oauth-2025-04-20` header + a system prefix identifying the request as Claude Code) so calls bill to the user's Claude Code subscription; otherwise we use the standard `ANTHROPIC_API_KEY` route. Default model `claude-sonnet-4-6`; override via `CLAUDE_MODEL`.
+A third piece of per-process state lives beside `pending` and `history`: `session = {"model": None}` — the `/model` override. It threads through the same `dispatch` → handler signatures (with the same `None`-tolerant defaults for old test call sites), is mutated in place by the `model:<key>` callback, and `_run_chat` passes it to `llm.chat(..., model=session.get("model"))`. Precedence: session override → `cfg.claude_model` → `llm.DEFAULT_MODEL`. Like the rest, it resets on restart.
+
+`src/llm.py` mirrors the credential-resolution pattern from `asset-management/server.js` (lines 241–302): if `CLAUDE_CODE_OAUTH_TOKEN` is set we use the OAuth route (Bearer token + `anthropic-beta: oauth-2025-04-20` header + a system prefix identifying the request as Claude Code) so calls bill to the user's Claude Code subscription; otherwise we use the standard `ANTHROPIC_API_KEY` route. Default model `claude-sonnet-4-6`; override via `CLAUDE_MODEL`, or per-session via the bot's `/model` command.
 
 **Photo bytes are never persisted.** The byte buffer is passed to Claude in-memory and dropped immediately; nothing is written to disk or SQLite. `tests/test_telegram_bot.py::test_photo_flow_does_not_leak_image_bytes_to_db` enforces this.
 
