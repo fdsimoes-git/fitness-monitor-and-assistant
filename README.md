@@ -61,6 +61,8 @@ For the chat assistant (optional), set ONE of these in `.env`:
 
 Default model is `claude-sonnet-4-6`; override via `CLAUDE_MODEL`, or per-session with the bot's `/model` command (in-memory — resets to the config default on bot restart).
 
+The bot registers its commands with Telegram on startup, so the "/" command menu is populated automatically — no BotFather `/setcommands` step needed.
+
 What you can say to the bot:
 
 | Input | What happens |
