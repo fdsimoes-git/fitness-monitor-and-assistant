@@ -1,0 +1,34 @@
+name: Release
+
+# Manually-dispatched release cutter. Creates the tag at the dispatched
+# commit and publishes a GitHub Release whose body comes from the
+# committed notes file .github/release-notes/<tag>.md — so release notes
+# are reviewed in a PR like any other change.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release (e.g. v1.1.0)"
+        required: true
+      title:
+        description: "Release title"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file ".github/release-notes/$TAG.md"
