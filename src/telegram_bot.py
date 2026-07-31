@@ -25,10 +25,12 @@ Dispatch tree
 ─────────────
   /help, /start                            → static help text
   /today, /balance                         → fast-path: today's calorie balance
+  /model                                   → fast-path: pick the session's Claude model
   numeric ^\\d{8,14}$                        → fast-path: OFF lookup → propose log
   any other text (with or without caption) → llm.chat() → propose / answer
   photo (with or without caption)          → llm.chat(image_bytes=…) → propose / answer
   callback_query (confirm:UUID/cancel:UUID) → execute or drop a pending action
+  callback_query (model:KEY)               → set the session's model override
 
 Photo bytes are passed to Claude in-memory and **discarded** — no SHA-256
 cache, no blob columns, nothing that would let raw inputs leak into SQLite.
@@ -61,6 +63,17 @@ MAX_BACKOFF_S = 60.0
 BARCODE_PATTERN = re.compile(r"^\d{8,14}$")
 HISTORY_MAX_PAIRS = 10  # keep the last N user/assistant pairs for context continuity
 THINKING_TEXT = "🔄 thinking…"
+
+# Per-session model choices for /model: key → (model id, button label).
+# `None` means "use the config default" (CLAUDE_MODEL / llm.DEFAULT_MODEL),
+# so the override can always be undone. Keys stay short — they ride in
+# callback_data as "model:<key>", capped at 64 bytes by Telegram.
+CHAT_MODELS: dict[str, tuple[str | None, str]] = {
+    "default": (None, "Default (config)"),
+    "sonnet": ("claude-sonnet-4-6", "Sonnet 4.6 — balanced"),
+    "haiku": ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
+    "opus": ("claude-opus-5", "Opus 5 — most capable"),
+}
 
 # Maps a tool name to a short, human-readable status the bot edits into the
 # in-flight "thinking" message before each tool runs. Keep these snappy —
@@ -98,6 +111,7 @@ HELP_TEXT = (
     "• _\"what did I eat yesterday?\"_\n\n"
     "*Commands* (fast paths)\n"
     "/help — this message\n"
+    "/model — pick the Claude model for this session\n"
     "/today — today's calorie balance\n"
     "/balance — alias for /today"
 )
@@ -125,13 +139,14 @@ def run(cfg: Config) -> None:
     backoff = INITIAL_BACKOFF_S
     pending: dict[str, dict[str, Any]] = {}
     history: list[dict[str, str]] = []
+    session: dict[str, Any] = {"model": None}
     while True:
         try:
             updates = _get_updates(cfg, offset)
             for u in updates:
                 offset = u["update_id"] + 1
                 try:
-                    dispatch(cfg, u, pending, history)
+                    dispatch(cfg, u, pending, history, session)
                 except Exception:  # noqa: BLE001 — never let one update kill the loop
                     log.exception("dispatch error")
             backoff = INITIAL_BACKOFF_S
@@ -170,6 +185,7 @@ def dispatch(
     update: dict,
     pending: dict[str, dict[str, Any]],
     history: list[dict[str, str]] | None = None,
+    session: dict[str, Any] | None = None,
 ) -> None:
     """Top-level update handler. Routes based on update kind and chat-id whitelist.
 
@@ -181,17 +197,23 @@ def dispatch(
     `run()`); chat-routed handlers append to it and trim. `None` is
     accepted for backward compatibility with tests that don't care about
     history continuity.
+
+    `session` holds per-process session settings (currently just the /model
+    override under key "model"), mutated in place by the model-picker
+    callback. Same lifetime and `None`-tolerance as `history`.
     """
     _sweep_pending(pending)
     if history is None:
         history = []
+    if session is None:
+        session = {}
     if "callback_query" in update:
         q = update["callback_query"]
         cb_chat = (q.get("message") or {}).get("chat", {}).get("id")
         if not _is_whitelisted(cfg, cb_chat):
             log.warning("Ignoring callback from non-whitelisted chat %s", cb_chat)
             return
-        _handle_callback(cfg, q, pending)
+        _handle_callback(cfg, q, pending, session)
         return
 
     msg = update.get("message")
@@ -202,9 +224,9 @@ def dispatch(
         log.warning("Ignoring message from non-whitelisted chat %s", chat_id)
         return
     if "photo" in msg:
-        _handle_photo(cfg, msg, pending, history)
+        _handle_photo(cfg, msg, pending, history, session)
     elif "text" in msg:
-        _handle_text(cfg, msg, pending, history)
+        _handle_text(cfg, msg, pending, history, session)
 
 
 def _is_whitelisted(cfg: Config, chat_id: Any) -> bool:
@@ -223,10 +245,13 @@ def _handle_text(
     msg: dict,
     pending: dict[str, dict[str, Any]],
     history: list[dict[str, str]],
+    session: dict[str, Any] | None = None,
 ) -> None:
     text = (msg.get("text") or "").strip()
     if not text:
         return
+    if session is None:
+        session = {}
 
     # Fast-path commands (deterministic, no Claude call). They intentionally
     # don't append to `history` — the agent only needs to remember
@@ -240,6 +265,9 @@ def _handle_text(
         # consistent if the helper ever changes).
         bal = db.calorie_balance_for_date(cfg.db_path, db.local_today().isoformat(), cfg=cfg)
         alerts.send_telegram(cfg, _format_balance(bal))
+        return
+    if text == "/model":
+        _send_model_picker(cfg, session)
         return
     if BARCODE_PATTERN.match(text):
         _propose_barcode(cfg, text, pending)
@@ -263,7 +291,7 @@ def _handle_text(
         text = body
 
     # Default: chat with the full tool surface.
-    _run_chat(cfg, text, pending, history)
+    _run_chat(cfg, text, pending, history, session=session)
 
 
 def _handle_photo(
@@ -271,6 +299,7 @@ def _handle_photo(
     msg: dict,
     pending: dict[str, dict[str, Any]],
     history: list[dict[str, str]],
+    session: dict[str, Any] | None = None,
 ) -> None:
     photos = msg.get("photo") or []
     if not photos:
@@ -281,7 +310,10 @@ def _handle_photo(
         _send_plain(cfg, "Couldn't download that photo from Telegram.")
         return
     caption = (msg.get("caption") or "").strip()
-    _run_chat(cfg, caption, pending, history, image_bytes=image_bytes, mime_type=mime_type)
+    _run_chat(
+        cfg, caption, pending, history,
+        image_bytes=image_bytes, mime_type=mime_type, session=session,
+    )
     # Reference released here; no persistence anywhere.
     del image_bytes
 
@@ -294,6 +326,7 @@ def _run_chat(
     *,
     image_bytes: bytes | None = None,
     mime_type: str | None = None,
+    session: dict[str, Any] | None = None,
 ) -> None:
     """Dispatch to llm.chat() with live progress feedback and surface a
     Confirm/Cancel keyboard for any write proposals it parked in `pending`.
@@ -321,6 +354,7 @@ def _run_chat(
         cfg, user_text, pending,
         image_bytes=image_bytes, mime_type=mime_type,
         history=history, progress_cb=progress_cb,
+        model=(session or {}).get("model"),
     )
     new_pids = [pid for pid in pending if pid not in pending_before]
 
@@ -459,6 +493,33 @@ def _confirmation_text(action: str, entry: dict[str, Any]) -> tuple[str, str, st
     return ("✅ Confirm", "❌ Cancel", f"Confirm pending {action}?")
 
 
+def _resolve_model(cfg: Config, session: dict[str, Any]) -> str:
+    """Effective model for this session: /model override, else CLAUDE_MODEL, else llm default."""
+    return session.get("model") or cfg.claude_model or llm.DEFAULT_MODEL
+
+
+def _send_model_picker(cfg: Config, session: dict[str, Any]) -> None:
+    """Show the current model and an inline keyboard of CHAT_MODELS choices.
+
+    Selection rides back as a `model:<key>` callback. Sent via
+    _send_with_keyboard (no parse_mode), so hyphenated model ids are safe.
+    """
+    override = session.get("model")
+    body = (
+        f"Current model: {_resolve_model(cfg, session)}"
+        + ("" if override else " (config default)")
+        + "\n\nPick a model for this session:"
+    )
+    keyboard = [
+        [{
+            "text": ("✓ " if (model_id or "") == (override or "") else "") + label,
+            "callback_data": f"model:{key}",
+        }]
+        for key, (model_id, label) in CHAT_MODELS.items()
+    ]
+    _send_with_keyboard(cfg, body, keyboard)
+
+
 def _sweep_pending(pending: dict[str, dict[str, Any]], ttl: float = PENDING_TTL_SECONDS) -> None:
     now = time.time()
     stale = [k for k, v in pending.items() if now - v.get("ts", 0) > ttl]
@@ -474,7 +535,8 @@ def _sweep_pending(pending: dict[str, dict[str, Any]], ttl: float = PENDING_TTL_
 
 
 def _handle_callback(
-    cfg: Config, q: dict, pending: dict[str, dict[str, Any]]
+    cfg: Config, q: dict, pending: dict[str, dict[str, Any]],
+    session: dict[str, Any] | None = None,
 ) -> None:
     data = (q.get("data") or "")
     callback_id = q.get("id")
@@ -485,6 +547,23 @@ def _handle_callback(
     msg = q.get("message") or {}
     chat_id = msg.get("chat", {}).get("id")
     msg_id = msg.get("message_id")
+
+    # Model picker taps never touch `pending` — handle before the
+    # confirm/cancel validation below.
+    if action == "model":
+        entry = CHAT_MODELS.get(pid)
+        if entry is None or session is None:
+            _answer_callback(cfg, callback_id, "Unknown model")
+            return
+        model_id, _label = entry
+        session["model"] = model_id
+        _answer_callback(cfg, callback_id, "Model set")
+        if chat_id and msg_id:
+            effective = model_id or f"{cfg.claude_model or llm.DEFAULT_MODEL} (default)"
+            _edit_message_remove_keyboard(
+                cfg, chat_id, msg_id, f"Model for this session: {effective}"
+            )
+        return
 
     # Validate the action BEFORE touching the pending dict so a bad/unknown
     # callback doesn't silently consume a still-pending proposal.

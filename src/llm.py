@@ -787,6 +787,7 @@ def chat(
     mime_type: str | None = None,
     history: list[dict] | None = None,
     progress_cb: "Any | None" = None,
+    model: str | None = None,
 ) -> str | None:
     """Run an agentic conversation turn against `CHAT_TOOLS` and return the
     final text answer.
@@ -813,6 +814,10 @@ def chat(
     Telegram bot to surface "🏷️ looking up barcode…" style status updates
     while the agent is mid-loop. Failures inside the callback are caught
     so a broken UI hook never breaks the chat turn.
+
+    `model`, when supplied, overrides the configured model for this call —
+    the bot's /model command passes the user's per-session pick here.
+    `None` falls back to `cfg.claude_model` / `DEFAULT_MODEL`.
 
     Returns `None` if no credentials, no text in the final reply, or the
     loop exceeds `CHAT_MAX_ITERATIONS`.
@@ -851,7 +856,7 @@ def chat(
 
     for _ in range(CHAT_MAX_ITERATIONS):
         response = client.messages.create(
-            model=cfg.claude_model or DEFAULT_MODEL,
+            model=model or cfg.claude_model or DEFAULT_MODEL,
             max_tokens=1024,
             system=system,
             messages=messages,

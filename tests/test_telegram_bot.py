@@ -9,8 +9,8 @@ After the chat-first refactor:
 - Write tools (log_meal/edit_meal/delete_meal) park proposals in `pending`
   via `llm._stash_pending`; the bot diffs `pending` before/after each chat
   call and surfaces a Confirm/Cancel inline keyboard for each new proposal.
-- `/help`, `/start`, `/today`, `/balance`, and numeric `^\\d{8,14}$` are
-  fast paths that bypass Claude.
+- `/help`, `/start`, `/today`, `/balance`, `/model`, and numeric
+  `^\\d{8,14}$` are fast paths that bypass Claude.
 """
 from __future__ import annotations
 
@@ -1060,3 +1060,108 @@ def test_redact_handles_token_url_in_quoted_context():
     out = _redact(msg)
     assert "42:TOK" not in out
     assert 'bot<redacted>/sendMessage"' in out
+
+
+# ── /model fast path + model: callbacks ───────────────────────────────────
+
+
+def test_model_command_shows_picker_and_skips_chat_and_history(tmpdb):
+    """/model is a fast path: inline keyboard of CHAT_MODELS, no Claude call,
+    no history pollution. callback_data must stay within Telegram's 64-byte cap."""
+    cfg = _make_cfg(tmpdb)
+    history: list[dict] = []
+    session = {"model": None}
+    with patch("src.telegram_bot._send_with_keyboard") as mock_kb, \
+         patch("src.telegram_bot.llm.chat") as mock_chat:
+        telegram_bot.dispatch(cfg, _msg(text="/model"), {}, history, session)
+    mock_chat.assert_not_called()
+    assert history == []
+    mock_kb.assert_called_once()
+    body, keyboard = mock_kb.call_args.args[1], mock_kb.call_args.args[2]
+    # Current (config-default) model is surfaced in the body.
+    assert "claude-sonnet-4-6" in body
+    assert "(config default)" in body
+    datas = [btn["callback_data"] for row in keyboard for btn in row]
+    assert datas == [f"model:{k}" for k in telegram_bot.CHAT_MODELS]
+    assert all(len(d.encode()) <= 64 for d in datas)
+
+
+def test_model_picker_marks_active_override(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    session = {"model": "claude-haiku-4-5"}
+    with patch("src.telegram_bot._send_with_keyboard") as mock_kb:
+        telegram_bot.dispatch(cfg, _msg(text="/model"), {}, [], session)
+    body, keyboard = mock_kb.call_args.args[1], mock_kb.call_args.args[2]
+    assert "claude-haiku-4-5" in body
+    assert "(config default)" not in body
+    marked = [btn["text"] for row in keyboard for btn in row if btn["text"].startswith("✓ ")]
+    assert marked == ["✓ Haiku 4.5 — fastest"]
+
+
+def test_model_callback_sets_session_model(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    session = {"model": None}
+    acks = []
+    with patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit, \
+         patch("src.telegram_bot._answer_callback",
+               side_effect=lambda cfg_, cid, text: acks.append(text)):
+        telegram_bot.dispatch(cfg, _callback("model:haiku"), {}, [], session)
+    assert session["model"] == "claude-haiku-4-5"
+    assert acks == ["Model set"]
+    mock_edit.assert_called_once()
+    assert "claude-haiku-4-5" in mock_edit.call_args.args[3]
+
+
+def test_model_callback_default_resets_override(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    session = {"model": "claude-haiku-4-5"}
+    with patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit:
+        telegram_bot.dispatch(cfg, _callback("model:default"), {}, [], session)
+    assert session["model"] is None
+    # The confirmation names the model that will actually be used.
+    assert "claude-sonnet-4-6 (default)" in mock_edit.call_args.args[3]
+
+
+def test_model_callback_unknown_key_is_rejected(tmpdb):
+    """A bogus model key must not mutate session state nor touch pending."""
+    cfg = _make_cfg(tmpdb)
+    session = {"model": None}
+    pending = {"pid-1": {"action": "insert", "meal": {}, "ts": time.time()}}
+    acks = []
+    with patch("src.telegram_bot._edit_message_remove_keyboard") as mock_edit, \
+         patch("src.telegram_bot._answer_callback",
+               side_effect=lambda cfg_, cid, text: acks.append(text)):
+        telegram_bot.dispatch(cfg, _callback("model:bogus"), pending, [], session)
+    assert session["model"] is None
+    assert "pid-1" in pending
+    assert acks == ["Unknown model"]
+    mock_edit.assert_not_called()
+
+
+def test_model_callback_never_touches_pending(tmpdb):
+    """Picking a model while a Confirm/Cancel proposal is in flight must
+    leave the proposal pending."""
+    cfg = _make_cfg(tmpdb)
+    session = {"model": None}
+    pending = {"pid-1": {"action": "insert", "meal": {}, "ts": time.time()}}
+    with patch("src.telegram_bot._edit_message_remove_keyboard"):
+        telegram_bot.dispatch(cfg, _callback("model:opus"), pending, [], session)
+    assert session["model"] == "claude-opus-5"
+    assert "pid-1" in pending
+
+
+def test_chat_passes_session_model_override(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    session = {"model": "claude-haiku-4-5"}
+    with patch("src.telegram_bot.llm.chat", return_value="hi!") as mock_chat:
+        telegram_bot.dispatch(cfg, _msg(text="how am I doing?"), {}, [], session)
+    mock_chat.assert_called_once()
+    assert mock_chat.call_args.kwargs["model"] == "claude-haiku-4-5"
+
+
+def test_chat_passes_none_model_without_override(tmpdb):
+    cfg = _make_cfg(tmpdb)
+    session = {"model": None}
+    with patch("src.telegram_bot.llm.chat", return_value="hi!") as mock_chat:
+        telegram_bot.dispatch(cfg, _msg(text="how am I doing?"), {}, [], session)
+    assert mock_chat.call_args.kwargs["model"] is None
