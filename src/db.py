@@ -777,6 +777,14 @@ def _daily_activity_load(db_path: Path, end_date_iso: str, days: int) -> dict[st
     return out
 
 
+# ACWR bands (Gabbett 2016): <0.8 undertrained, 0.8–1.3 optimal,
+# 1.3–1.5 caution, >1.5 high risk. The dashboard gauge draws its band
+# arcs from these same constants — keep them in sync by construction.
+ACWR_UNDERTRAINED_MAX = 0.8
+ACWR_OPTIMAL_MAX = 1.3
+ACWR_CAUTION_MAX = 1.5
+
+
 def acwr(db_path: Path, date_iso: str) -> dict:
     """Acute:Chronic Workload Ratio = mean(7d load) / mean(28d load).
 
@@ -793,11 +801,11 @@ def acwr(db_path: Path, date_iso: str) -> dict:
         band = None
     else:
         ratio = acute / chronic
-        if ratio < 0.8:
+        if ratio < ACWR_UNDERTRAINED_MAX:
             band = "undertrained"
-        elif ratio <= 1.3:
+        elif ratio <= ACWR_OPTIMAL_MAX:
             band = "optimal"
-        elif ratio <= 1.5:
+        elif ratio <= ACWR_CAUTION_MAX:
             band = "caution"
         else:
             band = "high_risk"
