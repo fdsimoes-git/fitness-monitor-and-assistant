@@ -116,6 +116,17 @@ HELP_TEXT = (
     "/balance — alias for /today"
 )
 
+# Commands registered with Telegram at startup (setMyCommands) so the
+# client's "/" menu lists them. Keep in sync with the fast paths in
+# _handle_text and the Commands block in HELP_TEXT. /start is omitted on
+# purpose — it's a /help alias Telegram already surfaces to new chats.
+BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("help", "How to use the bot"),
+    ("model", "Pick the Claude model for this session"),
+    ("today", "Today's calorie balance"),
+    ("balance", "Alias for /today"),
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main loop
@@ -135,6 +146,7 @@ def run(cfg: Config) -> None:
             "Telegram bot needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID set in .env"
         )
     log.info("Bot starting (long-poll)…")
+    _register_commands(cfg)
     offset: int | None = None
     backoff = INITIAL_BACKOFF_S
     pending: dict[str, dict[str, Any]] = {}
@@ -795,6 +807,28 @@ def _format_tool_status(tool_name: str, tool_input: dict) -> str:
         verb = "✏️ preparing edit" if tool_name == "edit_meal" else "🗑️ preparing delete"
         label = f"{verb} for meal #{tool_input['meal_id']}"
     return label + "…"
+
+
+def _register_commands(cfg: Config) -> None:
+    """Register BOT_COMMANDS with Telegram (setMyCommands) so the client's
+    "/" menu suggests them. Called once at startup; failure is non-fatal —
+    the commands still work, the menu just stays stale until the next start."""
+    api = TELEGRAM_API.format(token=cfg.telegram_bot_token)
+    try:
+        def _do():
+            r = requests.post(
+                f"{api}/setMyCommands",
+                json={"commands": [
+                    {"command": command, "description": description}
+                    for command, description in BOT_COMMANDS
+                ]},
+                timeout=10,
+            )
+            _check_telegram_ok(r)
+        _retry_transient(_do)
+        log.info("Registered %d bot commands with Telegram", len(BOT_COMMANDS))
+    except Exception as e:  # noqa: BLE001 — never let menu cosmetics block startup
+        log.warning("setMyCommands failed (non-fatal): %s", _redact(str(e)))
 
 
 def _send_plain(cfg: Config, text: str) -> bool:

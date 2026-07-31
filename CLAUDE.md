@@ -130,6 +130,8 @@ The ACWR / training-monotony / Z2-minutes / 7-day sleep-debt quartet (`db.acwr`,
 - **Numeric `^\d{8,14}$`** → `food.lookup_barcode` → `food.meal_from_barcode_info` → propose insert (no Claude call).
 - **Anything else (text, photo, photo+caption)** → `llm.chat(cfg, text, pending, image_bytes=…)`.
 
+`run()` registers the fast-path commands with Telegram at startup (`_register_commands` → `setMyCommands`) so the client's "/" menu suggests them. `BOT_COMMANDS` must stay in sync with the `_handle_text` fast paths and the Commands block in `HELP_TEXT`; `test_registered_commands_are_all_fast_paths` enforces that every menu entry resolves without a Claude call. Registration failure is non-fatal (logged, bot starts anyway).
+
 The 12 tools registered in `llm.CHAT_TOOLS`:
 
 | Read-only DB (8) | Validate-and-stash writes (3) | OFF lookup (1, read-only) |

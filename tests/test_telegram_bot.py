@@ -1165,3 +1165,60 @@ def test_chat_passes_none_model_without_override(tmpdb):
     with patch("src.telegram_bot.llm.chat", return_value="hi!") as mock_chat:
         telegram_bot.dispatch(cfg, _msg(text="how am I doing?"), {}, [], session)
     assert mock_chat.call_args.kwargs["model"] is None
+
+
+# ── command-menu registration (setMyCommands) ─────────────────────────────
+
+
+def test_register_commands_posts_bot_commands(tmpdb):
+    """Startup registration must send BOT_COMMANDS to setMyCommands in the
+    shape Telegram expects (lowercase a-z0-9_ names, 3-256 char descriptions)."""
+    import re as _re
+    cfg = _make_cfg(tmpdb)
+    captured = {}
+
+    def capture(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return type("R", (), {"raise_for_status": lambda self: None,
+                              "json": lambda self: {"ok": True, "result": True}})()
+
+    with patch("src.telegram_bot.requests.post", side_effect=capture):
+        telegram_bot._register_commands(cfg)
+    assert captured["url"].endswith("/setMyCommands")
+    sent = captured["json"]["commands"]
+    assert sent == [
+        {"command": c, "description": d} for c, d in telegram_bot.BOT_COMMANDS
+    ]
+    for entry in sent:
+        assert _re.fullmatch(r"[a-z0-9_]{1,32}", entry["command"])
+        assert 3 <= len(entry["description"]) <= 256
+
+
+def test_registered_commands_are_all_fast_paths(tmpdb):
+    """Every command in the Telegram menu must resolve deterministically —
+    tapping a menu entry may never fall through to a Claude call."""
+    cfg = _make_cfg(tmpdb)
+    for command, _desc in telegram_bot.BOT_COMMANDS:
+        with patch("src.telegram_bot.alerts.send_telegram"), \
+             patch("src.telegram_bot._send_with_keyboard"), \
+             patch("src.telegram_bot.db.calorie_balance_for_date",
+                   return_value={
+                       "date": "2026-05-05", "eaten_kcal": 0, "burned_kcal": 0,
+                       "bmr_kcal": 0, "steps_burned_kcal": 0, "total_burned_kcal": 0,
+                       "balance_kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0,
+                       "meal_count": 0,
+                   }), \
+             patch("src.telegram_bot.llm.chat") as mock_chat:
+            telegram_bot.dispatch(cfg, _msg(text=f"/{command}"), {})
+        mock_chat.assert_not_called()
+
+
+def test_register_commands_survives_network_failure(tmpdb, monkeypatch):
+    """A dead network at startup must not crash the bot — the menu is
+    cosmetic; the long-poll loop still has to come up."""
+    cfg = _make_cfg(tmpdb)
+    monkeypatch.setattr("src.telegram_bot.time.sleep", lambda s: None)
+    with patch("src.telegram_bot.requests.post",
+               side_effect=requests.exceptions.ConnectionError("no route")):
+        telegram_bot._register_commands(cfg)  # must not raise
