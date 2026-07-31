@@ -1,2 +1,3 @@
-"""garmin-monitor: BLE + Connect API health data pipeline."""
-__version__ = "0.1.0"
+"""garmin-monitor: Garmin Connect health-data platform — poller, smart
+alerts, nutrition log, FastAPI dashboard, and Telegram assistant."""
+__version__ = "1.1.0"
