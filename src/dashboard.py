@@ -1372,8 +1372,8 @@ def _acwr_gauge_svg(ratio: float | None, band: str | None) -> str:
         band_label = "AWAITING DATA"
         pill_cls = "pill-muted"
     else:
-        # Map ratio [0.0, 2.0] → [0, 1] for needle position; clamp.
-        needle_pct = max(0.0, min(1.0, ratio / 2.0))
+        # Map ratio [0, _ACWR_GAUGE_MAX] → [0, 1] for needle position; clamp.
+        needle_pct = max(0.0, min(1.0, ratio / _ACWR_GAUGE_MAX))
         ratio_text = f"{ratio:.2f}"
         band_label = {
             "undertrained": "UNDERTRAINED",
