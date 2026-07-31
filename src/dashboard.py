@@ -58,7 +58,9 @@ ROLLING_WINDOW = 7
 # ACWR gauge geometry: upper semicircle of a single shared circle. Bands and
 # needle must all use _gauge_point so their arcs stay on the same ring.
 _GAUGE_CX, _GAUGE_CY, _GAUGE_R = 100.0, 100.0, 80.0
-_ACWR_GAUGE_MAX = 2.0  # dial right end; needle_pct = ratio / _ACWR_GAUGE_MAX
+# Dial right end; needle_pct = ratio / _ACWR_GAUGE_MAX. Must stay above
+# db.ACWR_CAUTION_MAX or the caution band would overrun the semicircle.
+_ACWR_GAUGE_MAX = 2.0
 
 # (lo, hi, stroke, opacity) per band, bounds in ACWR ratio units.
 _ACWR_BANDS: tuple[tuple[float, float, str, str], ...] = (
