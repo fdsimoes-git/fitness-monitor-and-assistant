@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import socket
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -53,6 +54,35 @@ ALERT_COLORS = {
 }
 
 ROLLING_WINDOW = 7
+
+# ACWR gauge geometry: upper semicircle of a single shared circle. Bands and
+# needle must all use _gauge_point so their arcs stay on the same ring.
+_GAUGE_CX, _GAUGE_CY, _GAUGE_R = 100.0, 100.0, 80.0
+_ACWR_GAUGE_MAX = 2.0  # dial right end; needle_pct = ratio / _ACWR_GAUGE_MAX
+
+# (lo, hi, stroke, opacity) per band, bounds in ACWR ratio units.
+_ACWR_BANDS: tuple[tuple[float, float, str, str], ...] = (
+    (0.0, db.ACWR_UNDERTRAINED_MAX, "#0e8aa3", "0.8"),
+    (db.ACWR_UNDERTRAINED_MAX, db.ACWR_OPTIMAL_MAX, "#7ec831", "0.85"),
+    (db.ACWR_OPTIMAL_MAX, db.ACWR_CAUTION_MAX, "#cc8e00", "0.85"),
+    (db.ACWR_CAUTION_MAX, _ACWR_GAUGE_MAX, "#cc2570", "0.85"),
+)
+
+
+def _gauge_point(pct: float) -> tuple[float, float]:
+    """Map pct in [0, 1] to the gauge's upper semicircle (0 → left end, 1 → right end)."""
+    theta = math.pi * (1.0 - pct)
+    return (
+        _GAUGE_CX + _GAUGE_R * math.cos(theta),
+        _GAUGE_CY - _GAUGE_R * math.sin(theta),
+    )
+
+
+def _gauge_arc_path(start_pct: float, end_pct: float) -> str:
+    """SVG path `d` for an arc between two dial positions on the shared gauge circle."""
+    x0, y0 = _gauge_point(start_pct)
+    x1, y1 = _gauge_point(end_pct)
+    return f"M {x0:.1f} {y0:.1f} A {_GAUGE_R:.0f} {_GAUGE_R:.0f} 0 0 1 {x1:.1f} {y1:.1f}"
 
 # Heatmap colour scale (low → high readiness). Empty cells use gray.
 _HEATMAP_PALETTE = ["#1a1f2e", "#2d1640", "#5a1f4d", "#a8264e", "#ff2e88", "#ffb300", "#adfa3c", "#00f5ff"]
@@ -492,9 +522,15 @@ INDEX_HTML = """<!doctype html>
         const pct = Math.max(0, Math.min(1, parseFloat(el.dataset.ringPct)));
         const r = parseFloat(el.getAttribute('r'));
         const circ = 2 * Math.PI * r;
+        // On re-swaps a transition from the previous run would animate the
+        // reset itself (visible rewind) — disable it, commit the reset, then
+        // re-enable before animating to the target offset.
+        el.style.transition = 'none';
         el.style.strokeDasharray = circ;
         el.style.strokeDashoffset = circ;
-        // animate next frame
+        // Round linecaps render a floating dot even at zero length — hide.
+        el.style.opacity = pct > 0 ? '' : '0';
+        el.getBoundingClientRect();
         requestAnimationFrame(() => {
           el.style.transition = 'stroke-dashoffset 1.1s cubic-bezier(.6,.1,.2,1)';
           el.style.strokeDashoffset = circ * (1 - pct);
@@ -697,7 +733,8 @@ INDEX_HTML = """<!doctype html>
           datasets: [{
             data: [data.deep, data.light, data.rem, data.awake],
             backgroundColor: ['#6366f1', '#60a5fa', '#a78bfa', '#f59e0b'],
-            borderColor: '#0b1020',
+            borderWidth: 0,
+            spacing: 2,
           }],
         },
         options: { animation: false, plugins: { legend: { labels: { color: '#e5e7eb' } } } },
@@ -1073,7 +1110,7 @@ def _hero_html(readiness: dict, summary: dict) -> str:
         pill_class = "pill-muted"
     else:
         score_display = str(score)
-        pct = score / 100.0
+        pct = max(0.0, min(1.0, score / 100.0))
         rec_label, rec_sub = {
             "high":   ("PEAK · TRAIN HARD",  "Body's primed. Push the intensity today."),
             "medium": ("STEADY · MAINTAIN",  "Solid recovery — train as planned."),
@@ -1194,7 +1231,7 @@ def _stats_row_html(db_path: Path, summary: dict, trends: list[dict]) -> str:
       {_spark_card("Stress",
                    value="—" if stress is None else str(stress),
                    sub="avg today",
-                   canvas_id="stressSpark", spark_data=[],  # no historical stress in trends
+                   canvas_id="stressSpark", spark_data=[],
                    category="alerts",
                    countup_target=float(stress) if stress is not None else None,
                    info_id="stress")}
@@ -1322,7 +1359,11 @@ def _row5_html(activities: list[dict], cal_load: list[dict]) -> str:
 
 
 def _acwr_gauge_svg(ratio: float | None, band: str | None) -> str:
-    """Hand-rolled semicircular ACWR gauge. Sweet spot 0.8–1.3, danger >1.5 or <0.8."""
+    """Hand-rolled semicircular ACWR gauge.
+
+    Band arcs are generated from db.ACWR_UNDERTRAINED_MAX / ACWR_OPTIMAL_MAX /
+    ACWR_CAUTION_MAX so the drawing always matches the band classification.
+    """
     if ratio is None:
         needle_pct = 0.5
         ratio_text = "—"
@@ -1345,21 +1386,16 @@ def _acwr_gauge_svg(ratio: float | None, band: str | None) -> str:
             "high_risk":    "pill-magenta",
         }.get(band or "", "pill-muted")
 
-    # Semicircle: 180° from left to right. Convert needle_pct → angle in [-90°, +90°].
-    angle = -90 + 180 * needle_pct
-    needle_x = 100 + 80 * (angle / 180 * 2)  # rough linear placement
-    # Better: use trig
-    import math as _m
-    rad = _m.radians(angle - 90)
-    needle_x = 100 + 80 * _m.cos(rad)
-    needle_y = 100 + 80 * _m.sin(rad)
+    needle_x, needle_y = _gauge_point(needle_pct)
+    band_arcs = "\n      ".join(
+        f'<path d="{_gauge_arc_path(lo / _ACWR_GAUGE_MAX, hi / _ACWR_GAUGE_MAX)}" '
+        f'stroke="{color}" stroke-width="9" fill="none" opacity="{opacity}"/>'
+        for lo, hi, color, opacity in _ACWR_BANDS
+    )
     return f"""
     <svg viewBox="0 0 200 110" class="w-full max-w-[280px] mx-auto">
       <!-- band arcs (under-, optimal, caution, danger) -->
-      <path d="M 20 100 A 80 80 0 0 1 52 33" stroke="#0e8aa3" stroke-width="9" fill="none" opacity="0.8"/>
-      <path d="M 52 33 A 80 80 0 0 1 148 33" stroke="#7ec831" stroke-width="9" fill="none" opacity="0.85"/>
-      <path d="M 148 33 A 80 80 0 0 1 168 50" stroke="#cc8e00" stroke-width="9" fill="none" opacity="0.85"/>
-      <path d="M 168 50 A 80 80 0 0 1 180 100" stroke="#cc2570" stroke-width="9" fill="none" opacity="0.85"/>
+      {band_arcs}
       <!-- needle -->
       <line x1="100" y1="100" x2="{needle_x:.1f}" y2="{needle_y:.1f}"
             stroke="#e8edf2" stroke-width="2.5" stroke-linecap="round" filter="drop-shadow(0 0 4px rgba(255,255,255,0.6))"/>
